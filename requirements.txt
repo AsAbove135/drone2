@@ -1,0 +1,23 @@
+# MonoRace Simulation Environment Dependencies
+
+# Core Scientific & ML Libraries
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+scipy>=1.10.0
+matplotlib
+
+# Computer Vision
+opencv-python>=4.8.0
+
+# Reinforcement Learning
+stable-baselines3[extra]>=2.1.0
+tensorboard
+gymnasium
+
+# Note on Isaac Gym:
+# Isaac Gym is not available via standard PyPI. 
+# You will need to download it from the NVIDIA website:
+# https://developer.nvidia.com/isaac-gym
+# And install it locally:
+# pip install -e isaacgym/python
