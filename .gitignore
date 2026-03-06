@@ -51,3 +51,13 @@ gcnet_policy/
 *.zip
 *.pt
 *.pth
+
+# Data directories (too large for git)
+data/
+data_small/
+
+# TensorBoard logs
+tb_logs/
+
+# Test result images
+test_results/
