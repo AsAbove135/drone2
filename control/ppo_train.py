@@ -360,12 +360,13 @@ def train_ppo():
         clip_range=0.2,
         ent_coef=0.01,
         verbose=1,
+        device="cpu",  # MLP policy is faster on CPU than GPU
         tensorboard_log="./tb_logs/",
     )
 
     checkpoint_cb = CheckpointCallback(
-        save_freq=CHECKPOINT_FREQ // NUM_ENVS,
-        save_path="./checkpoints/",
+        save_freq=1_000_000 // NUM_ENVS,  # save every 1M steps (less disk usage)
+        save_path="D:/drone2_training/checkpoints/",
         name_prefix="gcnet_m23",
     )
 
@@ -375,10 +376,57 @@ def train_ppo():
         callback=checkpoint_cb,
     )
 
-    model.save("gcnet_m23_final")
-    env.save("vecnormalize_m23.pkl")
-    print("Training complete. Model saved to gcnet_m23_final.zip")
+    model.save("D:/drone2_training/gcnet_m23_final")
+    env.save("D:/drone2_training/vecnormalize_m23.pkl")
+    print("Training complete. Model saved to D:/drone2_training/gcnet_m23_final.zip")
+
+
+def resume_training(checkpoint_path, total_remaining=10_000_000):
+    """Resume PPO training from a checkpoint."""
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+    from stable_baselines3.common.callbacks import CheckpointCallback
+
+    print(f"Resuming from {checkpoint_path}...")
+
+    def make_env():
+        def _init():
+            return MonoRaceSimEnv()
+        return _init
+
+    env = SubprocVecEnv([make_env() for _ in range(NUM_ENVS)])
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
+    model = PPO.load(checkpoint_path, env=env, device="cpu")
+
+    checkpoint_cb = CheckpointCallback(
+        save_freq=1_000_000 // NUM_ENVS,
+        save_path="D:/drone2_training/checkpoints/",
+        name_prefix="gcnet_m23",
+    )
+
+    print(f"Continuing for {total_remaining:,} more timesteps...")
+    model.learn(
+        total_timesteps=total_remaining,
+        callback=checkpoint_cb,
+        reset_num_timesteps=False,
+    )
+
+    model.save("D:/drone2_training/gcnet_m23_final")
+    env.save("D:/drone2_training/vecnormalize_m23.pkl")
+    print("Training complete. Model saved to D:/drone2_training/gcnet_m23_final.zip")
 
 
 if __name__ == "__main__":
-    train_ppo()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from")
+    parser.add_argument("--remaining", type=int, default=10_000_000,
+                        help="Remaining timesteps when resuming")
+    args = parser.parse_args()
+
+    if args.resume:
+        resume_training(args.resume, args.remaining)
+    else:
+        train_ppo()
