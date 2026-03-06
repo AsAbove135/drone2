@@ -52,7 +52,7 @@ def train_sequential(
     gamma=0.99,
     gae_lambda=0.95,
     clip_range=0.2,
-    ent_coef=0.01,
+    ent_coef=0.001,
     vf_coef=0.5,
     max_grad_norm=0.5,
     max_segments=None,      # None = all segments, else stop after N
