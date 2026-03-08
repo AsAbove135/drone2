@@ -149,30 +149,39 @@ class RunningNorm:
 def train(
     num_envs=2048,
     total_timesteps=TOTAL_TIMESTEPS,
-    n_steps=64,             # Scaled from SB3 default (2048 / 1 env = 64 / 2048 envs)
+    n_steps=512,            # Longer rollouts for better credit assignment
     batch_size=4096,        # Scaled: keeps 32 minibatches/epoch like SB3's 2048/64
     n_epochs=10,            # SB3 default
     lr=3e-4,                # SB3 default
     gamma=0.99,             # SB3 default
     gae_lambda=0.95,        # SB3 default
     clip_range=0.2,         # SB3 default
-    ent_coef=0.0,           # M23 paper: 0 entropy
+    ent_coef=0.003,         # Small entropy bonus to prevent premature convergence
     vf_coef=0.5,            # SB3 default
     max_grad_norm=0.5,      # SB3 default
     vf_clip_range=None,     # SB3 default (no VF clipping)
     fixed_start=False,      # Spawn all envs in front of gate 1, no DR
     single_gate=False,      # Terminate on first gate passage (success)
+    random_segments=True,   # Randomly pick which segment each env trains on
     gate_size=None,         # Override gate size (None = use config default)
-    save_dir="D:/drone2_training",
+    save_dir="D:/drone2_training/latest",
     device="cuda",
 ):
+    import shutil
     device = torch.device(device)
+
+    # Wipe previous run data
+    if os.path.exists(save_dir):
+        shutil.rmtree(save_dir)
+        print(f"Cleaned up previous run in {save_dir}")
     os.makedirs(save_dir, exist_ok=True)
 
     mode_parts = []
     if fixed_start:
         mode_parts.append("FIXED START")
-    if single_gate:
+    if random_segments:
+        mode_parts.append("RANDOM SEGMENTS")
+    elif single_gate:
         mode_parts.append("SINGLE GATE")
     if gate_size:
         mode_parts.append(f"GATE={gate_size}m")
@@ -185,7 +194,8 @@ def train(
                           fixed_start=fixed_start,
                           domain_randomize=not fixed_start,
                           single_gate=single_gate,
-                          gate_size_override=gate_size)
+                          gate_size_override=gate_size,
+                          random_segments=random_segments)
 
     # Policy
     policy = ActorCritic(obs_dim=OBS_DIM, act_dim=4).to(device)
@@ -317,6 +327,12 @@ def train(
 
         if iteration % 10 == 0 or iteration == 1:
             avg_reward = buffer.rewards.sum(dim=0).mean().item()
+            gates_passed = env.gates_passed_count
+            eps_ended = env.episodes_ended_count
+            pass_rate = gates_passed / max(eps_ended, 1)
+            extra = f"Gates: {gates_passed}/{eps_ended} ({pass_rate:.1%})"
+            env.gates_passed_count = 0
+            env.episodes_ended_count = 0
             print(
                 f"Iter {iteration:5d}/{num_iterations} | "
                 f"Steps: {global_step:>12,} | "
@@ -327,7 +343,8 @@ def train(
                 f"Entropy: {sum(ent_losses)/len(ent_losses):.3f} | "
                 f"Clip: {sum(clip_fracs)/len(clip_fracs):.3f} | "
                 f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-                f"Diff: {difficulty:.2f}",
+                f"Diff: {difficulty:.2f} | "
+                f"{extra}",
                 flush=True,
             )
 
@@ -343,7 +360,7 @@ def train(
             }, ckpt_path)
 
     # Save final
-    tag = "single" if single_gate else ("fixed" if fixed_start else "gpu")
+    tag = "randseg" if random_segments else ("single" if single_gate else ("fixed" if fixed_start else "gpu"))
     final_path = os.path.join(save_dir, f"gcnet_m23_{tag}_final.pt")
     torch.save({
         'policy_state_dict': policy.state_dict(),
@@ -356,6 +373,7 @@ def train(
     print("=" * 70)
     print(f"Training complete! {global_step:,} steps in {elapsed:.1f}s ({global_step/elapsed:,.0f} FPS)")
     print(f"Model saved to {final_path}")
+    print('To keep this run: python control/save_run.py "description"')
 
 
 if __name__ == "__main__":
@@ -364,11 +382,13 @@ if __name__ == "__main__":
     parser.add_argument("--num-envs", type=int, default=2048)
     parser.add_argument("--timesteps", type=int, default=TOTAL_TIMESTEPS)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save-dir", type=str, default="D:/drone2_training")
+    parser.add_argument("--save-dir", type=str, default="D:/drone2_training/latest")
     parser.add_argument("--fixed-start", action="store_true",
                         help="Spawn all envs in front of gate 1, no DR or curriculum")
     parser.add_argument("--single-gate", action="store_true",
                         help="Terminate episode on first gate passage (success)")
+    parser.add_argument("--no-random-segments", action="store_true",
+                        help="Disable random segment selection (default: enabled)")
     parser.add_argument("--gate-size", type=float, default=None,
                         help="Override gate size in meters (default: config value)")
     args = parser.parse_args()
@@ -380,5 +400,6 @@ if __name__ == "__main__":
         save_dir=args.save_dir,
         fixed_start=args.fixed_start,
         single_gate=args.single_gate,
+        random_segments=not args.no_random_segments,
         gate_size=args.gate_size,
     )

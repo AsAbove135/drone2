@@ -38,59 +38,142 @@ K_R_SPEED = np.array([3.38e-3, 3.38e-3, 3.38e-3, 3.38e-3])  # per-motor yaw (spe
 K_R_ACCEL = np.array([3.24e-4, 3.24e-4, 3.24e-4, 3.24e-4])  # per-motor yaw (accel)
 J_Z = -0.34                     # gyroscopic coupling
 
+# Simplified dynamics model constants (used by control/dynamics.py)
+J = [0.005, 0.005, 0.009]       # diagonal inertia tensor [Jxx, Jyy, Jzz] (kg·m²)
+K_DRAG = 0.016                  # yaw drag-to-thrust ratio
+ARM_LENGTH = 0.125              # motor arm length (m)
+MOTOR_K = 1.0                   # motor first-order lag gain
+
 # Domain randomization ranges (M23: 50% on all except noted)
 DR_RANGE = 0.5                  # default ±50%
 DR_OMEGA_MAX = 0.4              # ±40% for omega_max
 DR_TAU = 0.55                   # ±55% for motor tau
 
-DT_SIM = 0.002                  # simulation timestep (500 Hz control)
+DT_SIM = 0.01                   # simulation timestep (100 Hz) — M23 paper value
 
 # === Reward Lambdas (M23 from Table 1) ===
-LAMBDA_PROG = 5.0
-LAMBDA_GATE = 10.0
+LAMBDA_PROG = 1.0               # M23 paper value
+LAMBDA_GATE = 1.5               # M23 paper value
 LAMBDA_RATE = 0.001
 LAMBDA_OFFSET = 1.5
 LAMBDA_PERC = 0.01
 LAMBDA_DELTA_U = 0.0            # not used in M23
 LAMBDA_U = 0.0                  # not used in M23
 LAMBDA_CRASH = 10.0
+LAMBDA_ALIGN = 0.0              # not in paper (GPU experimental only)
 V_MAX = 10.0                    # max progress reward clamp (m/s) — M23 paper value
 
 # === Observation ===
 OBS_DIM = 24  # p_gate(3) + v_gate(3) + euler_gate(3) + w_world(3) + w_body(3) + motors(4) + next_gate(3) + yaw(1) + dist(1)
 
-# === Track Layout ===
-# 11 gates in a 100x30m hall. NED convention: X forward, Y right, Z down.
+# === Track Layouts ===
+# All tracks in a 100x30m hall. NED convention: X forward, Y right, Z down.
 # Each gate: (x, y, z, yaw_rad) where yaw is the gate's facing direction.
-# Includes 2 double-gates (3-4 and 9-10) and 1 split-S (gates 6-7).
-GATE_POSITIONS = [
-    # Gate 1: Start straight
-    (5.0,  -13.0, -2.0,  0.0),
-    # Gate 2: Slight left
-    (15.0,  -8.0, -2.5,  0.3),
-    # Gate 3: Double-gate A (first)
-    (25.0,  -5.0, -2.0,  0.0),
-    # Gate 4: Double-gate A (second, close behind)
-    (30.0,  -5.0, -2.0,  0.0),
-    # Gate 5: Climbing right turn
-    (42.0, -10.0, -3.5, -0.4),
-    # Gate 6: Split-S entry (facing backward, high)
-    (55.0, -15.0, -4.0,  np.pi),
-    # Gate 7: Split-S exit (below gate 6, forward again)
-    (50.0, -15.0, -1.5,  0.0),
-    # Gate 8: Recovery straight
-    (62.0, -18.0, -2.0, -0.2),
-    # Gate 9: Double-gate B (first)
-    (75.0, -20.0, -2.5,  0.0),
-    # Gate 10: Double-gate B (second)
-    (80.0, -20.0, -2.5,  0.0),
-    # Gate 11: Finish
-    (92.0, -15.0, -2.0,  0.3),
-]
+
+TRACKS = {
+    # --- Easy: Gentle S-curve, flat altitude, 7 gates (point-to-point) ---
+    # Smooth sweeping turns, constant Z=-2.0, ~12m gate spacing
+    "easy": [
+        (10.0, -15.0, -2.0,  0.0),    # G1: start straight
+        (22.0, -13.0, -2.0,  0.15),   # G2: slight left
+        (35.0, -11.0, -2.0,  0.1),    # G3: continuing left
+        (48.0, -12.0, -2.0, -0.1),    # G4: start curving right
+        (60.0, -15.0, -2.0, -0.15),   # G5: gentle right
+        (72.0, -17.0, -2.0, -0.1),    # G6: continuing right
+        (85.0, -16.0, -2.0,  0.1),    # G7: straighten to finish
+    ],
+
+    # --- Medium: Rolling hills, moderate turns + altitude, 9 gates (point-to-point) ---
+    # S-curves with +-1m altitude changes, ~10m gate spacing
+    "medium": [
+        ( 8.0, -14.0, -2.0,  0.0),    # G1: start
+        (18.0, -10.0, -2.0,  0.3),    # G2: left turn
+        (30.0,  -8.0, -2.5,  0.1),    # G3: climb
+        (42.0, -10.0, -3.0, -0.2),    # G4: descend + right
+        (52.0, -15.0, -2.5, -0.4),    # G5: right turn
+        (60.0, -20.0, -2.0, -0.3),    # G6: right + level out
+        (70.0, -18.0, -2.5,  0.2),    # G7: left + climb
+        (80.0, -15.0, -3.0,  0.15),   # G8: climb
+        (90.0, -14.0, -2.0,  0.0),    # G9: descend to finish
+    ],
+
+    # --- Hard: Technical course, tight turns + big Z changes, 11 gates (point-to-point) ---
+    # Sharp direction changes, chicane, 1.5m altitude range, ~8-11m spacing
+    "hard": [
+        ( 8.0, -13.0, -2.0,  0.0),    # G1: start
+        (18.0,  -8.0, -2.5,  0.4),    # G2: sharp left + climb
+        (28.0,  -6.0, -3.0,  0.1),    # G3: continue climb
+        (38.0, -10.0, -2.5, -0.5),    # G4: sharp right + descend
+        (45.0, -16.0, -2.0, -0.6),    # G5: tight right
+        (50.0, -20.0, -1.5, -0.3),    # G6: drop altitude
+        (58.0, -18.0, -2.5,  0.3),    # G7: chicane left + climb
+        (63.0, -14.0, -3.5,  0.5),    # G8: sharp left + big climb
+        (72.0, -12.0, -2.5,  0.1),    # G9: level out
+        (82.0, -15.0, -2.0, -0.3),    # G10: right + descend
+        (92.0, -13.0, -2.0,  0.0),    # G11: finish
+    ],
+
+    # --- Expert: Original M23-inspired course (point-to-point) ---
+    # Double-gates, split-S, 2m+ altitude range
+    "expert": [
+        ( 5.0, -13.0, -2.0,  0.0),    # G1: start straight
+        (15.0,  -8.0, -2.5,  0.3),    # G2: slight left
+        (25.0,  -5.0, -2.0,  0.0),    # G3: double-gate A (first)
+        (30.0,  -5.0, -2.0,  0.0),    # G4: double-gate A (second)
+        (42.0, -10.0, -3.5, -0.4),    # G5: climbing right turn
+        (55.0, -15.0, -4.0,  np.pi),  # G6: split-S entry (backward, high)
+        (50.0, -15.0, -1.5,  0.0),    # G7: split-S exit (below G6)
+        (62.0, -18.0, -2.0, -0.2),    # G8: recovery straight
+        (75.0, -20.0, -2.5,  0.0),    # G9: double-gate B (first)
+        (80.0, -20.0, -2.5,  0.0),    # G10: double-gate B (second)
+        (92.0, -15.0, -2.0,  0.3),    # G11: finish
+    ],
+
+    # --- Kidney bean: Classic FPV racing circuit, 10 gates (lap circuit) ---
+    # Oval with concave indent on top side, flat altitude, CW direction
+    # Gate yaw = tangent travel direction at each gate
+    "kidney": [
+        (30.0, -22.0, -2.0, -0.30),   # G1:  bottom-left, heading right
+        (42.0, -23.0, -2.0,  0.0),    # G2:  bottom center-left
+        (55.0, -22.0, -2.0,  0.21),   # G3:  bottom center-right
+        (66.0, -18.0, -2.0,  0.54),   # G4:  bottom-right, curving up
+        (70.0, -13.0, -2.0,  1.86),   # G5:  right end, tight turn
+        (63.0,  -8.0, -2.0,  3.04),   # G6:  top-right, heading left
+        (50.0, -11.0, -2.0,  3.14),   # G7:  kidney indent (concave dip)
+        (37.0,  -8.0, -2.0, -3.10),   # G8:  top-left, heading left
+        (28.0, -12.0, -2.0, -2.36),   # G9:  left end, tight turn
+        (27.0, -18.0, -2.0, -1.37),   # G10: left-bottom, heading down-right
+    ],
+
+    # --- Figure-8: Classic FPV racing circuit, 10 gates (lap circuit) ---
+    # Two tangent loops (R=10m), right loop CW + left loop CCW
+    # Crossing gates at center, offset 1m apart for distinct detection
+    "figure8": [
+        (51.0, -14.0, -2.0,  1.57),   # G1:  crossing A, heading into right loop
+        (57.0,  -5.0, -2.0,  0.32),   # G2:  right loop upper-left
+        (68.0,  -8.0, -2.0, -0.93),   # G3:  right loop upper-right
+        (68.0, -20.0, -2.0, -2.21),   # G4:  right loop lower-right
+        (57.0, -23.0, -2.0,  2.82),   # G5:  right loop lower-left
+        (49.0, -14.0, -2.0,  1.57),   # G6:  crossing B, heading into left loop
+        (43.0,  -5.0, -2.0,  2.82),   # G7:  left loop upper-right
+        (32.0,  -8.0, -2.0, -2.21),   # G8:  left loop upper-left
+        (32.0, -20.0, -2.0, -0.93),   # G9:  left loop lower-left
+        (43.0, -23.0, -2.0,  0.32),   # G10: left loop lower-right
+    ],
+}
+
+# Active track selection (change this to switch tracks)
+ACTIVE_TRACK = "easy"
+GATE_POSITIONS = TRACKS[ACTIVE_TRACK]
 GATE_SIZE = 0.40                # inner opening side length (m) — M23 paper value
 GATE_THICKNESS = 1.0            # gate thickness (m) — M23 paper value
 NUM_LAPS = 2
 NUM_GATES = len(GATE_POSITIONS)
+
+# Max distance between consecutive gates (used as spawn distance hard max)
+_gate_dists = [np.sqrt(sum((a - b)**2 for a, b in zip(GATE_POSITIONS[i][:3], GATE_POSITIONS[i+1][:3])))
+               for i in range(len(GATE_POSITIONS) - 1)]
+MAX_GATE_DISTANCE = max(_gate_dists)  # ~13.9m (G5→G6)
 
 # === Domain Randomization (ranges defined above with dynamics params) ===
 
@@ -103,10 +186,10 @@ INIT_RP_RANGE = (-np.pi / 9, np.pi / 9)
 INIT_YAW_RANGE = (-np.pi, np.pi)
 INIT_OMEGA_RANGE = (-0.1, 0.1)
 
-# === Environment Bounds (paper: x∈[1,95], y∈[-27,1]) ===
-BOUNDS_X = (1.0, 95.0)
-BOUNDS_Y = (-27.0, 1.0)
-BOUNDS_Z = (-6.0, 0.0)         # NED: ceiling=-6, floor=0 (ground collision handled separately)
+# === Environment Bounds (paper: x∈[1,95], y∈[-27,1], padded +10m for training) ===
+BOUNDS_X = (-9.0, 105.0)
+BOUNDS_Y = (-37.0, 11.0)
+BOUNDS_Z = (-10.0, 0.0)        # NED: ceiling=-10, floor=0 (ground collision handled separately)
 
 # === Ground Collision (M23) ===
 H_GROUND = 0.0                 # ground height in NED (z >= 0 = at/below ground)
@@ -116,7 +199,7 @@ V_GROUND = 2.0                 # speed threshold for ground crash (m/s)
 OMEGA_MAX_TERMINATION = 29.6706  # 1700 deg/s in rad/s
 
 # === Training ===
-MAX_EPISODE_STEPS = 4000        # at 500Hz = 8 seconds
+MAX_EPISODE_STEPS = 4000        # at 100Hz DT=0.01 = 40 seconds
 NUM_ENVS = 8
 TOTAL_TIMESTEPS = 50_000_000
 CHECKPOINT_FREQ = 100_000

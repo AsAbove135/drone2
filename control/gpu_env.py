@@ -14,8 +14,8 @@ from config import (
     MASS, K_OMEGA, K_X, K_Y, K_X2, K_Y2, K_ALPHA, K_HOR, PROP_RADIUS,
     K_P, K_Q, K_R_SPEED, K_R_ACCEL, J_X, J_Y, J_Z,
     MOTOR_TAU, MOTOR_K_CMD, MOTOR_OMEGA_MIN, MOTOR_OMEGA_MAX,
-    GRAVITY, DT_SIM, OBS_DIM,
-    LAMBDA_PROG, LAMBDA_GATE, LAMBDA_RATE, LAMBDA_OFFSET,
+    GRAVITY, OBS_DIM,
+    LAMBDA_RATE, LAMBDA_OFFSET,
     LAMBDA_PERC, LAMBDA_CRASH, V_MAX,
     GATE_POSITIONS, GATE_SIZE, NUM_LAPS, NUM_GATES,
     DR_RANGE, DR_OMEGA_MAX, DR_TAU, MAX_EPISODE_STEPS,
@@ -24,6 +24,12 @@ from config import (
     BOUNDS_X, BOUNDS_Y, BOUNDS_Z,
     H_GROUND, V_GROUND, OMEGA_MAX_TERMINATION,
 )
+
+# GPU experimental overrides (differ from paper values in config.py)
+DT_SIM = 0.005          # higher fidelity than paper's 0.01
+LAMBDA_PROG = 1.5       # boosted from paper's 1.0
+LAMBDA_GATE = 10.0      # boosted from paper's 1.5
+LAMBDA_ALIGN = 10.0     # trajectory alignment (not in paper)
 
 
 # ── Batched quaternion/euler helpers ──────────────────────────────
@@ -195,7 +201,8 @@ class BatchedDroneEnv:
     Manages N parallel environments as batched CUDA tensors.
     """
     def __init__(self, num_envs=2048, device="cuda", fixed_start=False,
-                 domain_randomize=True, single_gate=False, gate_size_override=None):
+                 domain_randomize=True, single_gate=False, gate_size_override=None,
+                 random_segments=False):
         self.N = num_envs
         self.device = torch.device(device)
         self.dt = DT_SIM
@@ -204,6 +211,9 @@ class BatchedDroneEnv:
         self.fixed_start = fixed_start
         self.domain_randomize = domain_randomize
         self.single_gate = single_gate
+        self.random_segments = random_segments
+        if random_segments:
+            self.single_gate = True  # each env does one gate passage
         self.gate_size = gate_size_override if gate_size_override is not None else GATE_SIZE
         # Segment training: (from_gate_idx, to_gate_idx) or None
         self.segment = None
@@ -328,9 +338,55 @@ class BatchedDroneEnv:
         self.env_motor_k_cmd[mask] = dr(MOTOR_K_CMD)
 
     def _random_state(self, n):
-        """Generate n random initial states with curriculum-based spawning."""
+        """Generate n random initial states with curriculum-based spawning.
+        Returns (state [n, 17], target_gates [n] or None).
+        target_gates is set when random_segments is active."""
         dev = self.device
         d = self.difficulty
+
+        if self.random_segments:
+            # Random segment selection: each env gets a random gate-to-gate segment
+            # seg_idx 0 = start->gate0, seg_idx k = gate(k-1)->gate(k)
+            seg_idx = torch.randint(0, NUM_GATES, (n,), device=dev)
+            target_gates = seg_idx  # target gate for each env
+            is_first = seg_idx == 0
+            from_idx = (seg_idx - 1).clamp(min=0)
+
+            # Compute spawn centers for seg>0: 1m past from_gate along its normal
+            from_pos = self.gates_pos[from_idx]        # [n, 3]
+            from_normal = self.gates_normal[from_idx]  # [n, 3]
+            spawn_after = from_pos + from_normal * 1.0
+
+            # Compute spawn centers for seg==0: 3m before gate 0
+            spawn_before = (self.gates_pos[0] - self.gates_normal[0] * 3.0).unsqueeze(0).expand(n, 3)
+
+            spawn_center = torch.where(is_first.unsqueeze(-1), spawn_before, spawn_after)
+
+            # Facing yaw: toward target gate
+            to_pos = self.gates_pos[seg_idx]  # [n, 3]
+            diff = to_pos - spawn_center
+            facing_yaw_computed = torch.atan2(diff[:, 1], diff[:, 0])
+            # For seg==0, use gate 0's yaw directly
+            facing_yaw = torch.where(is_first, self.gates_yaw[0].expand(n), facing_yaw_computed)
+
+            p = spawn_center.clone()
+            p += torch.empty(n, 3, device=dev).uniform_(-0.3, 0.3)
+
+            # Velocity: 2 m/s toward target for seg>0, small random for seg==0
+            direction = diff / (diff.norm(dim=-1, keepdim=True) + 1e-8)
+            v_toward = direction * 2.0 + torch.empty(n, 3, device=dev).uniform_(-1.0, 1.0)
+            v_small = torch.empty(n, 3, device=dev).uniform_(-0.5, 0.5)
+            v = torch.where(is_first.unsqueeze(-1), v_small, v_toward)
+
+            yaw = facing_yaw + torch.empty(n, device=dev).uniform_(-math.radians(5), math.radians(5))
+            roll = torch.empty(n, device=dev).uniform_(-math.radians(5), math.radians(5))
+            pitch = torch.empty(n, device=dev).uniform_(-math.radians(5), math.radians(5))
+
+            euler = torch.stack([roll, pitch, yaw], dim=-1)
+            q = batch_euler_to_quat(euler)
+            w = torch.zeros(n, 3, device=dev)
+            motors = torch.full((n, 4), self.hover_omega, device=dev)
+            return torch.cat([p, v, q, w, motors], dim=-1), target_gates
 
         if self.segment is not None or self.fixed_start:
             # Segment or fixed-start spawning
@@ -377,7 +433,7 @@ class BatchedDroneEnv:
             q = batch_euler_to_quat(euler)
             w = torch.zeros(n, 3, device=dev)
             motors = torch.full((n, 4), self.hover_omega, device=dev)
-            return torch.cat([p, v, q, w, motors], dim=-1)
+            return torch.cat([p, v, q, w, motors], dim=-1), None
 
         if d >= 0.99:
             # Full random (original behavior)
@@ -441,7 +497,7 @@ class BatchedDroneEnv:
         # Motors at hover speed instead of idle
         motors = torch.full((n, 4), self.hover_omega, device=dev)
 
-        return torch.cat([p, v, q, w, motors], dim=-1)
+        return torch.cat([p, v, q, w, motors], dim=-1), None
 
     def _find_nearest_gate(self, positions):
         """Find nearest gate ahead for each position. [N, 3] -> [N] long."""
@@ -466,10 +522,13 @@ class BatchedDroneEnv:
         """Reset all environments."""
         mask = torch.ones(self.N, dtype=torch.bool, device=self.device)
         self._randomize_params(mask)
-        self.states = self._random_state(self.N)
+        states, target_gates = self._random_state(self.N)
+        self.states = states
         self.prev_states = self.states.clone()
         self.prev_motor_speeds = self.states[:, 13:17].clone()
-        if self.segment is not None:
+        if target_gates is not None:
+            self.gate_idx = target_gates
+        elif self.segment is not None:
             self.gate_idx[:] = self.segment[1]
         else:
             self.gate_idx = self._find_nearest_gate(self.states[:, 0:3])
@@ -482,11 +541,13 @@ class BatchedDroneEnv:
         if n == 0:
             return
         self._randomize_params(mask)
-        new_states = self._random_state(n)
+        new_states, target_gates = self._random_state(n)
         self.states[mask] = new_states
         self.prev_states[mask] = new_states
         self.prev_motor_speeds[mask] = new_states[:, 13:17]
-        if self.segment is not None:
+        if target_gates is not None:
+            self.gate_idx[mask] = target_gates
+        elif self.segment is not None:
             self.gate_idx[mask] = self.segment[1]
         else:
             self.gate_idx[mask] = self._find_nearest_gate(new_states[:, 0:3])
@@ -625,6 +686,7 @@ class BatchedDroneEnv:
 
         half = self.gate_size / 2.0
         within = crossed & (local[:, 1].abs() < half) & (local[:, 2].abs() < half)
+        # Crossed gate plane but missed the opening = failed attempt, terminate
         hit_frame = crossed & ~within
 
         offset = (local[:, 1]**2 + local[:, 2]**2).sqrt()
@@ -638,20 +700,74 @@ class BatchedDroneEnv:
         self.gate_idx[within] += 1
         self.gates_passed_count += within.sum().item()
 
-        # 3. Angular rate penalty
-        r_rate = -LAMBDA_RATE * (w_body**2).sum(dim=-1)
+        # 3. Trajectory alignment reward
+        # Project velocity onto gate plane: reward aiming at gate center
+        # Uses a virtual target radius (2m) so the drone can earn positive reward
+        # even when not perfectly aimed at the tiny 0.4m opening
+        v = self.states[:, 3:6]
+        ALIGN_RADIUS = 2.0  # virtual target radius for alignment reward
 
-        # 4. Perception penalty
-        euler = batch_quat_to_euler(q)
-        cam_off = (euler[:, 0]**2 + euler[:, 1]**2).sqrt()
-        r_perc = torch.where(cam_off > (math.pi / 3),
-                             -LAMBDA_PERC * cam_off,
+        # Time for velocity ray to hit gate plane
+        v_dot_n = (v * gate_normal).sum(dim=-1)                 # [N]
+        p_to_gate = gate_pos - p                                # [N, 3]
+        dist_to_plane = (p_to_gate * gate_normal).sum(dim=-1)   # [N]
+        t_hit = dist_to_plane / (v_dot_n + 1e-8)               # [N]
+
+        # Projected intersection with gate plane
+        p_hit = p + v * t_hit.unsqueeze(-1)                     # [N, 3]
+
+        # Offset from gate center in gate-local Y-Z
+        hit_local = torch.bmm(gate_R_inv, (p_hit - gate_pos).unsqueeze(-1)).squeeze(-1)
+        miss_dist = (hit_local[:, 1]**2 + hit_local[:, 2]**2).sqrt()  # [N]
+
+        moving_toward = t_hit > 0
+
+        # Steeper inside radius: +2 at center, 0 at edge; -1 max outside
+        align_score = torch.where(
+            miss_dist < ALIGN_RADIUS,
+            2.0 * (1.0 - miss_dist / ALIGN_RADIUS),            # [0, +2] inside
+            -(miss_dist - ALIGN_RADIUS).clamp(max=ALIGN_RADIUS) / ALIGN_RADIUS,  # [-1, 0] outside
+        )
+        r_align = torch.where(
+            moving_toward,
+            LAMBDA_ALIGN * align_score,
+            -LAMBDA_ALIGN * torch.ones(1, device=self.device),
+        ) * self.dt
+
+        # 4. Angular rate penalty (world-frame angular velocity per paper: ||Ω_k||²)
+        qw, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        R_rate = torch.empty((q.shape[0], 3, 3), device=self.device, dtype=q.dtype)
+        R_rate[:, 0, 0] = 1 - 2 * (qy**2 + qz**2)
+        R_rate[:, 0, 1] = 2 * (qx*qy - qw*qz)
+        R_rate[:, 0, 2] = 2 * (qx*qz + qw*qy)
+        R_rate[:, 1, 0] = 2 * (qx*qy + qw*qz)
+        R_rate[:, 1, 1] = 1 - 2 * (qx**2 + qz**2)
+        R_rate[:, 1, 2] = 2 * (qy*qz - qw*qx)
+        R_rate[:, 2, 0] = 2 * (qx*qz - qw*qy)
+        R_rate[:, 2, 1] = 2 * (qy*qz + qw*qx)
+        R_rate[:, 2, 2] = 1 - 2 * (qx**2 + qy**2)
+        w_world = torch.bmm(R_rate, w_body.unsqueeze(-1)).squeeze(-1)
+        r_rate = -LAMBDA_RATE * (w_world**2).sum(dim=-1)
+
+        # 5. Perception penalty: angle between camera axis and gate direction
+        gate_dir = gate_pos - p  # [N, 3]
+        gate_dist = gate_dir.norm(dim=-1, keepdim=True).clamp(min=0.1)  # [N, 1]
+        gate_dir_norm = gate_dir / gate_dist  # [N, 3]
+        # Camera forward = first column of R (body x-axis in world frame)
+        cam_fwd = torch.stack([
+            1 - 2 * (qy**2 + qz**2),
+            2 * (qx*qy + qw*qz),
+            2 * (qx*qz - qw*qy),
+        ], dim=-1)  # [N, 3]
+        cos_theta = (cam_fwd * gate_dir_norm).sum(dim=-1).clamp(-1.0, 1.0)  # [N]
+        theta_cam = torch.acos(cos_theta)  # [N]
+        r_perc = torch.where(theta_cam > math.radians(45),  # M23: θ_cam = 45° (Table 1)
+                             -LAMBDA_PERC * theta_cam,
                              torch.zeros(1, device=self.device))
 
-        rewards = r_prog + r_gate + r_offset + r_rate + r_perc
+        rewards = r_prog + r_gate + r_offset + r_rate + r_perc + r_align
 
         # Termination
-        v = self.states[:, 3:6]
         speed = v.norm(dim=-1)
 
         oob = ((p[:, 0] < BOUNDS_X[0]) | (p[:, 0] > BOUNDS_X[1]) |

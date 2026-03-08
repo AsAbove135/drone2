@@ -1,19 +1,27 @@
 # MonoRace Paper Ground Truth Reference
 # Source: arxiv 2601.15222v1
 
-## 1. Observation Space (M23: 24D, NOT 20D)
+## 1. Observation Space (M23: 24D)
 ```
 x_obs = [p^(gi), v^(gi), Φ^(gi), Ω, ω, p_(gi+1)^(gi), ψ_(gi+1)^(gi)]^T
 ```
 - p^(gi): position in gate frame (3)
 - v^(gi): velocity in gate frame (3)
 - Φ^(gi): euler angles in gate frame (3)
-- Ω: angular velocity WORLD frame (3)
-- ω: motor speeds (4)  ← paper says 4 motor speeds
+- Ω: angular velocity — paper formula lists once but text says 24D (3)
+- ω: motor speeds (4)
 - p_(gi+1)^(gi): next gate pos in current gate frame (3)
 - ψ_(gi+1)^(gi): next gate relative yaw (1)
-Total: 3+3+3+3+4+3+1 = 20... BUT paper text says 24.
-The difference: paper includes BOTH world angular velocity (3) AND body angular velocity (3) = 6 extra - 2 already counted = net 24.
+Formula sums to 20, but paper text explicitly says "The policy takes in 24 observations."
+
+Previous paper (arxiv 2504.21586v1) uses SAME formula but says 20 observations.
+New paper (2601.15222v1) says 24 — so 4 new dims were added but formula wasn't updated.
+Evidence: new paper mentions "angular velocities in world and body frames" (6 total vs 3).
+That accounts for 3 extra dims (20→23). The 24th dim is unknown.
+
+Our implementation (24D):
+- Dims 1-20: match the formula exactly (using BOTH w_world AND w_body = 23)
+- Dim 24: dist_gate (our addition, not confirmed in paper)
 
 ## 2. G&CNet Architecture
 - 3 hidden layers × 64 neurons each
@@ -75,12 +83,16 @@ Note: includes gyroscopic coupling terms (J_x*qr, J_y*pr, J_z*pq).
 | Gate bonus | λ_gate (on passage) | 1.5 |
 | Rate penalty | -λ_rate * ‖Ω_k‖² | 0.001 |
 | Offset penalty | -λ_offset * ‖p_k - p_gk‖ (at passage) | 1.5 |
-| Perception penalty | -λ_perc * θ_cam (if θ_cam > π/3) | 0.01 |
+| Perception penalty | -λ_perc * θ_cam (if θ_cam > θ_cam_thresh) | 0.01 |
 | Δu penalty | -λ_Δu * Σmax(|u_i[k]-u_i[k-1]| - thresh, 0) | 0.0 (M23) |
 | Low action | -λ_u * Σmax(0.5 - u_i, 0) | 0.0 (M23) |
 | Crash | -λ_crash | 10.0 |
 
 **v_max = 10** (M23), NOT 20
+
+**θ_cam = 45°** for M23 (Table 1) — the angle between camera optical axis and gate center
+- θ_cam is per-drone, NOT the general π/3 from the reward formula description
+- Penalty applies when θ_cam exceeds this threshold
 
 ## 6. Gate Specifications (M23)
 - Inner opening: **g_size = 0.40 m** (NOT 1.5 m!)
