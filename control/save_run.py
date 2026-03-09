@@ -40,6 +40,16 @@ def save_run(description):
     print(f"Size: {total_mb:.1f} MB")
     print(f"Files: {len(os.listdir(dest_path))}")
 
+    # Auto-generate charts if CSV exists
+    csv_path = os.path.join(dest_path, "training_stats.csv")
+    if os.path.exists(csv_path):
+        try:
+            from control.plot_training import generate_charts
+            results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results_tracking')
+            generate_charts(csv_path, results_dir, dest_name)
+        except Exception as e:
+            print(f"Chart generation failed: {e}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

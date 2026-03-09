@@ -59,8 +59,6 @@ class MonoRaceSimEnv(gym.Env):
     gate_size_current = 1.5    # start large, shrink over training
     spawn_dist_min = 2.0       # start close, widen over training
     spawn_dist_max = 3.0
-    speed_lambda = 0.0         # speed bonus weight (0→1 over training)
-    gate_lambda = 1.5          # gate reward weight (1.5→3.0 over training)
     track_pool = None          # list of track names to randomize over (None = use default)
 
     def __init__(self, near_gate_spawn=True):
@@ -86,6 +84,7 @@ class MonoRaceSimEnv(gym.Env):
         self.episodes_count = 0
         self.steps_since_gate = 0
         self.ep_gates_passed = 0   # gates passed this episode (for scaling reward)
+        self.ep_reward = 0.0       # cumulative reward this episode
 
     # ── Gate frame transforms ──────────────────────────────────────
 
@@ -208,49 +207,46 @@ class MonoRaceSimEnv(gym.Env):
     # ── Reward function (M23) ──────────────────────────────────────
 
     def _compute_reward(self, state_np, prev_state_np, action):
+        """M23 paper reward + turning-toward-gate shaping."""
         p = state_np[0:3]
         p_prev = prev_state_np[0:3]
         w_body = state_np[10:13]
         q = state_np[6:10]
+        q_prev = prev_state_np[6:10]
 
         gi = self.current_gate_idx % self.num_gates
-        gate_pos = np.array(self.gates[gi][:3])
+        gx, gy, gz, g_yaw = self.gates[gi]
+        gate_pos = np.array([gx, gy, gz])
 
-        # 1. Progress reward: getting closer to current gate
         dist_prev = np.linalg.norm(p_prev - gate_pos)
         dist_curr = np.linalg.norm(p - gate_pos)
         progress = dist_prev - dist_curr
+
+        # 1. Progress reward (paper)
         r_prog = LAMBDA_PROG * min(progress, V_MAX * DT_SIM)
 
         # 2. Gate passage check
         r_gate = 0.0
         r_offset = 0.0
         passed, hit_frame, offset = self._check_gate_passage(p_prev, p, gi)
-        r_speed = 0.0
         if passed:
             self.ep_gates_passed += 1
-            # Scale gate reward: 1x for first, 2x for second, 3x for third, etc.
-            gate_multiplier = self.ep_gates_passed
-            r_gate = MonoRaceSimEnv.gate_lambda * gate_multiplier
+            r_gate = 2.5 * self.ep_gates_passed  # 2.5, 5.0, 7.5, 10.0, ...
             r_offset = -LAMBDA_OFFSET * offset
-            # Speed bonus: higher reward for fewer steps between gates
-            lam = MonoRaceSimEnv.speed_lambda
-            if lam > 0 and self.steps_since_gate > 0:
-                r_speed = lam * (1.0 - self.steps_since_gate / self.max_steps)
             self.current_gate_idx += 1
             self.gates_passed += 1
             self.steps_since_gate = 0
         elif hit_frame:
             self._crashed = True
 
-        # 2b. Proximity shaping: small reward for being close to gate center
-        # Only when within 3m AND moving toward the gate (prevents hovering)
-        r_proximity = 0.0
-        if dist_curr < 3.0 and progress > 0:
-            # Linear bonus: max 0.05 at gate center, 0 at 3m
-            r_proximity = 0.05 * (1.0 - dist_curr / 3.0)
+        # 2b. Missed-gate detection: drone >2m past gate plane without passing
+        if not passed:
+            gate_normal = np.array([np.cos(g_yaw), np.sin(g_yaw), 0.0])
+            signed_dist = np.dot(p - gate_pos, gate_normal)
+            if signed_dist > 2.0:
+                self._crashed = True
 
-        # 3. Angular rate penalty (world-frame angular velocity per paper: ||Ω_k||²)
+        # 3. Angular rate penalty (paper: ||Ω_world||²)
         qw, qx, qy, qz = q
         R = np.array([
             [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qw*qz), 2*(qx*qz + qw*qy)],
@@ -260,14 +256,12 @@ class MonoRaceSimEnv(gym.Env):
         w_world = R @ w_body
         r_rate = -LAMBDA_RATE * np.sum(w_world**2)
 
-        # 4. Perception penalty: angle between camera axis and gate direction
+        # 4. Perception penalty (paper: camera angle to gate)
         gate_dir = gate_pos - p
         gate_dist = np.linalg.norm(gate_dir)
         r_perc = 0.0
         if gate_dist > 0.1:
             gate_dir_norm = gate_dir / gate_dist
-            # Camera forward = first column of rotation matrix (body x-axis in world frame)
-            # qw, qx, qy, qz already extracted above for rate penalty
             cam_fwd = np.array([
                 1 - 2*(qy**2 + qz**2),
                 2*(qx*qy + qw*qz),
@@ -275,11 +269,44 @@ class MonoRaceSimEnv(gym.Env):
             ])
             cos_theta = np.clip(np.dot(cam_fwd, gate_dir_norm), -1.0, 1.0)
             theta_cam = np.arccos(cos_theta)
-            if theta_cam > np.radians(45):  # M23: θ_cam = 45° (Table 1)
+            if theta_cam > np.radians(45):
                 r_perc = -LAMBDA_PERC * theta_cam
 
+        # 5. Turning-toward-gate reward (new)
+        # Positive when drone turns to face the gate, negative when turning away
+        LAMBDA_TURN = 1.0
+        r_turn = 0.0
+        gate_dir_prev = gate_pos - p_prev
+        dist_prev_gate = np.linalg.norm(gate_dir_prev)
+        if gate_dist > 0.1 and dist_prev_gate > 0.1:
+            # Current heading angle to gate
+            gate_dir_norm_curr = gate_dir / gate_dist
+            cam_fwd_curr = np.array([
+                1 - 2*(qy**2 + qz**2),
+                2*(qx*qy + qw*qz),
+                2*(qx*qz - qw*qy),
+            ])
+            cos_curr = np.clip(np.dot(cam_fwd_curr, gate_dir_norm_curr), -1.0, 1.0)
+            theta_curr = np.arccos(cos_curr)
+
+            # Previous heading angle to gate
+            qw_p, qx_p, qy_p, qz_p = q_prev
+            gate_dir_norm_prev = gate_dir_prev / dist_prev_gate
+            cam_fwd_prev = np.array([
+                1 - 2*(qy_p**2 + qz_p**2),
+                2*(qx_p*qy_p + qw_p*qz_p),
+                2*(qx_p*qz_p - qw_p*qy_p),
+            ])
+            cos_prev = np.clip(np.dot(cam_fwd_prev, gate_dir_norm_prev), -1.0, 1.0)
+            theta_prev = np.arccos(cos_prev)
+
+            # Scale turning reward by progress: only reward turning when
+            # actively flying toward the gate, prevents oscillation exploit
+            progress_frac = max(progress, 0.0) / (V_MAX * DT_SIM)
+            r_turn = LAMBDA_TURN * (theta_prev - theta_curr) * progress_frac
+
         self.steps_since_gate += 1
-        reward = r_prog + r_gate + r_offset + r_rate + r_perc + r_proximity + r_speed
+        reward = r_prog + r_gate + r_offset + r_rate + r_perc + r_turn
         return reward
 
     # ── Find nearest gate ahead ────────────────────────────────────
@@ -408,6 +435,7 @@ class MonoRaceSimEnv(gym.Env):
         self.step_count = 0
         self.steps_since_gate = 0
         self.ep_gates_passed = 0
+        self.ep_reward = 0.0
         self._crashed = False
 
         if self.near_gate_spawn:
@@ -429,6 +457,7 @@ class MonoRaceSimEnv(gym.Env):
 
         # Reward
         reward = self._compute_reward(state_np, self.prev_state_np, action)
+        self.ep_reward += reward
 
         # Termination checks
         p = state_np[0:3]
@@ -464,7 +493,12 @@ class MonoRaceSimEnv(gym.Env):
         # Clamp obs to prevent NaN propagation
         obs = np.nan_to_num(obs, nan=0.0, posinf=100.0, neginf=-100.0)
 
-        return obs, float(reward), terminated, truncated, {}
+        info = {}
+        if terminated or truncated:
+            info["ep_gates_passed"] = self.ep_gates_passed
+            info["ep_reward"] = self.ep_reward
+
+        return obs, float(reward), terminated, truncated, info
 
 
 def train_ppo(near_gate_spawn=True):
@@ -475,35 +509,49 @@ def train_ppo(near_gate_spawn=True):
     from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
     class GateCurriculumCallback(BaseCallback):
-        """Logs gate passages, shrinks gate size, and widens spawn distance."""
-        def __init__(self, total_timesteps, gate_start=1.5, gate_end=0.40,
-                     dist_start=(2.0, 3.0), dist_end=(2.0, MAX_GATE_DISTANCE),
-                     advance_threshold=1.0, advance_step=0.05):
+        """Linear curriculum: gate size 1.5→0.5m, spawn dist 2-3m→2-20m, full by 2M steps."""
+        CURRICULUM_STEPS = 2_000_000
+        GATE_START, GATE_END = 1.5, 0.5
+        DIST_MAX_START, DIST_MAX_END = 3.0, 20.0
+
+        def __init__(self, csv_path=None, **kwargs):
             super().__init__(verbose=0)
-            self._total = total_timesteps
-            self._gate_start = gate_start
-            self._gate_end = gate_end
-            self._dist_min_start, self._dist_max_start = dist_start
-            self._dist_min_end, self._dist_max_end = dist_end
-            self._advance_threshold = advance_threshold  # pass rate to trigger advance
-            self._advance_step = advance_step            # how much to bump frac per advance
-            self._frac = 0.0                             # adaptive curriculum fraction
             self._last_log = 0
+            self._ep_gate_counts = []  # collect per-episode gate counts
+            self._ep_rewards = []      # collect per-episode rewards
+            self._csv_path = csv_path
+            self._csv_initialized = False
+
+        def _init_csv(self):
+            if self._csv_path and not self._csv_initialized:
+                num_gates = len(GATE_POSITIONS) * NUM_LAPS
+                with open(self._csv_path, 'w') as f:
+                    cols = ["steps", "reward_mean", "gate_pass_rate", "avg_gates",
+                            "gate_size", "spawn_dist_max", "frac",
+                            "entropy", "explained_var", "approx_kl", "clip_fraction"]
+                    cols += [f"pct_ge_{i}" for i in range(1, num_gates + 1)]
+                    f.write(",".join(cols) + "\n")
+                self._csv_initialized = True
 
         def _on_step(self):
-            # Minimum floor: linear fraction (so curriculum never falls behind time)
-            time_frac = min(1.0, self.num_timesteps / self._total)
-            frac = max(self._frac, time_frac)
+            self._init_csv()
+            frac = min(1.0, self.num_timesteps / self.CURRICULUM_STEPS)
 
-            # Apply curriculum
-            new_size = self._gate_start + (self._gate_end - self._gate_start) * frac
-            MonoRaceSimEnv.gate_size_current = new_size
-            MonoRaceSimEnv.spawn_dist_min = self._dist_min_start + (self._dist_min_end - self._dist_min_start) * frac
-            MonoRaceSimEnv.spawn_dist_max = self._dist_max_start + (self._dist_max_end - self._dist_max_start) * frac
-            MonoRaceSimEnv.speed_lambda = frac
-            MonoRaceSimEnv.gate_lambda = 1.5 + 1.5 * frac  # 1.5 → 3.0
+            MonoRaceSimEnv.gate_size_current = self.GATE_START + (self.GATE_END - self.GATE_START) * frac
+            MonoRaceSimEnv.spawn_dist_min = 2.0
+            MonoRaceSimEnv.spawn_dist_max = self.DIST_MAX_START + (self.DIST_MAX_END - self.DIST_MAX_START) * frac
 
-            # Log every 100K steps + check pass rate for adaptive advance
+            # Collect per-episode gate counts and rewards from info dicts
+            for info in self.locals.get("infos", []):
+                src = info
+                if "terminal_info" in info:
+                    src = info["terminal_info"]
+                if "ep_gates_passed" in src:
+                    self._ep_gate_counts.append(src["ep_gates_passed"])
+                if "ep_reward" in src:
+                    self._ep_rewards.append(src["ep_reward"])
+
+            # Log every 100K steps
             if self.num_timesteps - self._last_log >= 100_000:
                 self._last_log = self.num_timesteps
                 try:
@@ -519,28 +567,57 @@ def train_ppo(near_gate_spawn=True):
                     total_eps = 0
                 rate = total_gates / max(total_eps, 1)
 
-                # Adaptive: if pass rate >= threshold, advance curriculum
-                advanced = ""
-                if rate >= self._advance_threshold and frac < 1.0:
-                    self._frac = min(1.0, frac + self._advance_step)
-                    advanced = " ^"
+                # Compute gate distribution from collected episode data
+                num_gates_total = len(GATE_POSITIONS) * NUM_LAPS
+                ep_counts = self._ep_gate_counts if self._ep_gate_counts else [0]
+                avg_gates = np.mean(ep_counts)
+                n_eps = len(ep_counts)
+                pct_ge = []
+                for threshold in range(1, num_gates_total + 1):
+                    pct = sum(1 for c in ep_counts if c >= threshold) / max(n_eps, 1) * 100
+                    pct_ge.append(pct)
+
+                # Mean episode reward from collected data
+                rew_mean = np.mean(self._ep_rewards) if self._ep_rewards else 0.0
+
+                # PPO training stats from SB3's logger
+                logger_vals = getattr(self.model, 'logger', None)
+                name_to_val = getattr(logger_vals, 'name_to_value', {}) if logger_vals else {}
+                entropy = -name_to_val.get("train/entropy_loss", 0.0)  # SB3 logs negative entropy
+                explained_var = name_to_val.get("train/explained_variance", 0.0)
+                approx_kl = name_to_val.get("train/approx_kl", 0.0)
+                clip_fraction = name_to_val.get("train/clip_fraction", 0.0)
 
                 # Log to tensorboard
+                self.logger.record("curriculum/ep_reward_mean", rew_mean)
                 self.logger.record("curriculum/gate_pass_rate", rate * 100)
-                self.logger.record("curriculum/gate_size", new_size)
+                self.logger.record("curriculum/gate_size", MonoRaceSimEnv.gate_size_current)
                 self.logger.record("curriculum/spawn_dist_max", MonoRaceSimEnv.spawn_dist_max)
                 self.logger.record("curriculum/frac", frac)
-                self.logger.record("curriculum/gate_lambda", MonoRaceSimEnv.gate_lambda)
-                self.logger.record("curriculum/speed_lambda", MonoRaceSimEnv.speed_lambda)
+                self.logger.record("curriculum/avg_gates", avg_gates)
+                for i, pct in enumerate(pct_ge):
+                    self.logger.record(f"gates/pct_ge_{i+1}", pct)
+
+                # Write CSV row
+                if self._csv_path:
+                    with open(self._csv_path, 'a') as f:
+                        row = [self.num_timesteps, rew_mean, rate * 100, avg_gates,
+                               MonoRaceSimEnv.gate_size_current, MonoRaceSimEnv.spawn_dist_max, frac,
+                               entropy, explained_var, approx_kl, clip_fraction]
+                        row += pct_ge
+                        f.write(",".join(f"{v:.4f}" for v in row) + "\n")
 
                 print(f"  [Gate] Steps: {self.num_timesteps:>10,} | "
-                      f"Size: {new_size:.2f}m | "
-                      f"Spawn: {MonoRaceSimEnv.spawn_dist_min:.1f}-{MonoRaceSimEnv.spawn_dist_max:.1f}m | "
-                      f"Speed: {MonoRaceSimEnv.speed_lambda:.2f} | "
-                      f"GLam: {MonoRaceSimEnv.gate_lambda:.2f} | "
-                      f"Frac: {frac:.2f}{advanced} | "
-                      f"Passed: {total_gates}/{total_eps} eps ({rate:.1%})",
+                      f"Size: {MonoRaceSimEnv.gate_size_current:.2f}m | "
+                      f"Spawn: 2.0-{MonoRaceSimEnv.spawn_dist_max:.1f}m | "
+                      f"Frac: {frac:.2f} | "
+                      f"Passed: {total_gates}/{total_eps} eps ({rate:.1%}) | "
+                      f"Avg gates: {avg_gates:.2f} | "
+                      f">=1: {pct_ge[0]:.0f}%",
                       flush=True)
+
+                self._ep_gate_counts = []  # reset for next window
+                self._ep_rewards = []
             return True
 
     save_dir = "D:/drone2_training/latest"
@@ -552,9 +629,8 @@ def train_ppo(near_gate_spawn=True):
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(os.path.join(save_dir, "checkpoints"), exist_ok=True)
 
-    # Track randomization: train on multiple track layouts
-    MonoRaceSimEnv.track_pool = ["kidney", "figure8", "expert"]
-    print(f"Track pool: {MonoRaceSimEnv.track_pool}")
+    # Track selection: train on a single track
+    MonoRaceSimEnv.track_pool = None  # disabled — use GATE_POSITIONS from config
 
     spawn_mode = "near-gate" if near_gate_spawn else "uniform"
     print(f"Setting up MonoRace M23 Training Environment (spawn: {spawn_mode})...")
@@ -568,7 +644,7 @@ def train_ppo(near_gate_spawn=True):
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
     policy_kwargs = dict(
-        net_arch=[64, 64, 64],
+        net_arch=[128, 128, 128],
         activation_fn=nn.ReLU,
     )
 
@@ -587,7 +663,7 @@ def train_ppo(near_gate_spawn=True):
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.0,
+        ent_coef=0.01,
         verbose=1,
         device="cpu",
         tensorboard_log=os.path.join(save_dir, "tb_logs"),
@@ -616,11 +692,13 @@ def train_ppo(near_gate_spawn=True):
         save_freq=1_000_000,
         save_path=os.path.join(save_dir, "checkpoints"),
     )
-    gate_cb = GateCurriculumCallback(TOTAL_TIMESTEPS, gate_start=1.5, gate_end=GATE_SIZE)
+    csv_log_path = os.path.join(save_dir, "training_stats.csv")
+    gate_cb = GateCurriculumCallback(csv_path=csv_log_path)
 
     print(f"Starting PPO Training ({TOTAL_TIMESTEPS:,} timesteps, {NUM_ENVS} envs)...")
-    print(f"Gate curriculum: 1.5m -> {GATE_SIZE}m over training")
-    print(f"Spawn distance curriculum: 2-3m -> 2-{MAX_GATE_DISTANCE:.1f}m over training")
+    print(f"Curriculum: gate {GateCurriculumCallback.GATE_START}m -> {GateCurriculumCallback.GATE_END}m, "
+          f"spawn 2-{GateCurriculumCallback.DIST_MAX_START}m -> 2-{GateCurriculumCallback.DIST_MAX_END}m, "
+          f"full by {GateCurriculumCallback.CURRICULUM_STEPS/1e6:.0f}M steps")
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=[checkpoint_cb, vecnorm_cb, gate_cb],

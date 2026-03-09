@@ -163,7 +163,7 @@ TRACKS = {
 }
 
 # Active track selection (change this to switch tracks)
-ACTIVE_TRACK = "easy"
+ACTIVE_TRACK = "kidney"
 GATE_POSITIONS = TRACKS[ACTIVE_TRACK]
 GATE_SIZE = 0.40                # inner opening side length (m) — M23 paper value
 GATE_THICKNESS = 1.0            # gate thickness (m) — M23 paper value

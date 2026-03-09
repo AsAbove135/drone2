@@ -17,16 +17,20 @@ import config
 
 
 class EvalEnv(MonoRaceSimEnv):
-    """MonoRaceSimEnv that always spawns behind gate 0 for evaluation."""
-    def __init__(self, track_gates=None):
+    """MonoRaceSimEnv that spawns behind a specified gate for evaluation."""
+    def __init__(self, track_gates=None, start_gate=0):
         super().__init__(near_gate_spawn=True)
         if track_gates is not None:
             self.gates = list(track_gates)
+        self.start_gate = start_gate
+
+    def set_start_gate(self, gate_idx):
+        self.start_gate = gate_idx
 
     def reset(self, **kwargs):
         obs, info = super().reset(**kwargs)
-        # Override: place behind gate 0
-        gx, gy, gz, g_yaw = self.gates[0]
+        gi = self.start_gate % len(self.gates)
+        gx, gy, gz, g_yaw = self.gates[gi]
         spawn_dist = 3.0
         px = gx - spawn_dist * np.cos(g_yaw)
         py = gy - spawn_dist * np.sin(g_yaw)
@@ -41,10 +45,13 @@ class EvalEnv(MonoRaceSimEnv):
         state_np[8] = 0.0                  # qy
         state_np[9] = np.sin(g_yaw / 2)   # qz
         state_np[10:13] = 0.0  # zero body rates
+        # Hover motor speeds: thrust = mg shared across 4 motors
+        hover_omega = np.sqrt(config.MASS * config.GRAVITY / (4 * config.K_OMEGA))
+        state_np[13:17] = hover_omega
 
         self.state = torch.tensor([state_np], dtype=torch.float32)
         self.prev_state_np = state_np.copy()
-        self.current_gate_idx = 0
+        self.current_gate_idx = gi
         self.step_count = 0
         self.steps_since_gate = 0
         self._crashed = False
@@ -53,23 +60,11 @@ class EvalEnv(MonoRaceSimEnv):
         return obs, info
 
 
-def evaluate(checkpoint_path, track_name=None, vecnorm_path=None, num_episodes=8, max_steps=4000):
-    """Run policy from behind gate 0 on the specified track, collect trajectories."""
-    # Resolve track gates
-    if track_name and track_name in config.TRACKS:
-        track_gates = config.TRACKS[track_name]
-    else:
-        track_gates = config.GATE_POSITIONS
-        track_name = config.ACTIVE_TRACK
-
-    num_gates = len(track_gates)
-
-    # Set gate size to training value for fair eval
-    MonoRaceSimEnv.gate_size_current = 1.5
-
+def _load_model_and_env(checkpoint_path, track_gates, vecnorm_path=None, gate_size=1.5):
+    """Load model and set up env with VecNormalize."""
+    MonoRaceSimEnv.gate_size_current = gate_size
     env = DummyVecEnv([lambda: EvalEnv(track_gates=track_gates)])
 
-    # Try to load VecNormalize stats
     vn_loaded = False
     if vecnorm_path and os.path.exists(vecnorm_path):
         env = VecNormalize.load(vecnorm_path, env)
@@ -104,41 +99,94 @@ def evaluate(checkpoint_path, track_name=None, vecnorm_path=None, num_episodes=8
         env.norm_reward = False
 
     model = PPO.load(checkpoint_path, env=env, device="cpu")
+    return model, env
+
+
+def _run_episode(model, env, inner_env, max_steps=4000):
+    """Run a single episode and return trajectory, gates passed, crash status."""
+    num_gates = len(inner_env.gates)
+    obs = env.reset()
+
+    traj = [inner_env.state.cpu().numpy().squeeze(0)[:3].copy()]
+    start_gate = inner_env.current_gate_idx
+    max_gate_idx = start_gate
+    crashed = False
+
+    for step in range(max_steps):
+        cur_gate = inner_env.current_gate_idx
+        max_gate_idx = max(max_gate_idx, cur_gate)
+        was_crashed = inner_env._crashed
+
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, info = env.step(action)
+
+        if not done[0]:
+            p = inner_env.state.cpu().numpy().squeeze(0)[:3]
+            traj.append(p.copy())
+            max_gate_idx = max(max_gate_idx, inner_env.current_gate_idx)
+        else:
+            crashed = was_crashed or inner_env._crashed
+            break
+
+    gates_passed = max_gate_idx - start_gate
+    return np.array(traj), gates_passed, start_gate, crashed
+
+
+def evaluate(checkpoint_path, track_name=None, vecnorm_path=None, num_episodes=8, max_steps=4000):
+    """Run policy from behind gate 0 on the specified track, collect trajectories."""
+    if track_name and track_name in config.TRACKS:
+        track_gates = config.TRACKS[track_name]
+    else:
+        track_gates = config.GATE_POSITIONS
+        track_name = config.ACTIVE_TRACK
+
+    num_gates = len(track_gates)
+    model, env = _load_model_and_env(checkpoint_path, track_gates, vecnorm_path)
+    inner_env = env.envs[0] if hasattr(env, 'envs') else env.venv.envs[0]
 
     trajectories = []
     gates_passed_list = []
 
     for ep in range(num_episodes):
-        obs = env.reset()
-        inner_env = env.envs[0] if hasattr(env, 'envs') else env.venv.envs[0]
-
-        traj = [inner_env.state.cpu().numpy().squeeze(0)[:3].copy()]
-        max_gate_idx = 0
-        crashed = False
-
-        for step in range(max_steps):
-            cur_gate = inner_env.current_gate_idx
-            max_gate_idx = max(max_gate_idx, cur_gate)
-            was_crashed = inner_env._crashed
-
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, info = env.step(action)
-
-            if not done[0]:
-                p = inner_env.state.cpu().numpy().squeeze(0)[:3]
-                traj.append(p.copy())
-                max_gate_idx = max(max_gate_idx, inner_env.current_gate_idx)
-            else:
-                crashed = was_crashed or inner_env._crashed
-                break
-
-        trajectories.append(np.array(traj))
-        gates_passed_list.append(max_gate_idx)
+        traj, gp, sg, crashed = _run_episode(model, env, inner_env, max_steps)
+        trajectories.append(traj)
+        gates_passed_list.append(gp)
         print(f"  Episode {ep+1}/{num_episodes}: {len(traj)} steps, "
-              f"{max_gate_idx}/{num_gates} gates"
+              f"{gp}/{num_gates} gates"
               f"{' CRASHED' if crashed else ''}")
 
     return trajectories, gates_passed_list, track_gates, track_name
+
+
+def evaluate_per_gate(checkpoint_path, track_name=None, vecnorm_path=None,
+                      runs_per_gate=4, max_steps=4000, gate_size=0.5):
+    """Run policy from behind each gate, collect trajectories per starting gate."""
+    if track_name and track_name in config.TRACKS:
+        track_gates = config.TRACKS[track_name]
+    else:
+        track_gates = config.GATE_POSITIONS
+        track_name = config.ACTIVE_TRACK
+
+    num_gates = len(track_gates)
+    model, env = _load_model_and_env(checkpoint_path, track_gates, vecnorm_path, gate_size=gate_size)
+    inner_env = env.envs[0] if hasattr(env, 'envs') else env.venv.envs[0]
+
+    trajectories = []
+    gates_passed_list = []
+    start_gates = []
+
+    for gi in range(num_gates):
+        inner_env.set_start_gate(gi)
+        for run in range(runs_per_gate):
+            traj, gp, sg, crashed = _run_episode(model, env, inner_env, max_steps)
+            trajectories.append(traj)
+            gates_passed_list.append(gp)
+            start_gates.append(gi)
+            print(f"  Gate {gi+1}/{num_gates}, Run {run+1}/{runs_per_gate}: "
+                  f"{len(traj)} steps, {gp} gates passed"
+                  f"{' CRASHED' if crashed else ''}")
+
+    return trajectories, gates_passed_list, start_gates, track_gates, track_name
 
 
 def plot_eval(trajectories, gates_passed_list, track_gates, track_name):
@@ -204,6 +252,89 @@ def plot_eval(trajectories, gates_passed_list, track_gates, track_name):
     plt.close()
 
 
+def plot_eval_per_gate(trajectories, gates_passed_list, start_gates, track_gates, track_name,
+                       save_path=None):
+    """Plot per-gate evaluation: color-coded by starting gate."""
+    num_gates = len(track_gates)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 14))
+
+    eval_gate_size = MonoRaceSimEnv.gate_size_current
+    half = max(eval_gate_size / 2.0, 0.5)
+
+    # Draw gates
+    for i in range(num_gates):
+        cx, cy, cz, yaw = track_gates[i]
+        perp_x = -np.sin(yaw) * half
+        perp_y = np.cos(yaw) * half
+        ax1.plot([cx - perp_x, cx + perp_x], [cy - perp_y, cy + perp_y],
+                 color='gray', linewidth=4, zorder=5, solid_capstyle='round')
+        ax1.annotate(f'G{i+1}', (cx, cy), textcoords="offset points",
+                     xytext=(0, 10), ha='center', fontsize=9, fontweight='bold')
+
+        vis_half = max(eval_gate_size / 2.0, 0.3)
+        ax2.plot([cx, cx], [cz - vis_half, cz + vis_half],
+                 color='gray', linewidth=4, zorder=5, solid_capstyle='round')
+        ax2.annotate(f'G{i+1}', (cx, cz - vis_half), textcoords="offset points",
+                     xytext=(0, 10), ha='center', fontsize=9, fontweight='bold')
+
+    # Color by starting gate
+    cmap = plt.cm.tab10
+    for i, traj in enumerate(trajectories):
+        if len(traj) < 2:
+            continue
+        sg = start_gates[i]
+        color = cmap(sg / max(num_gates, 1))
+        gp = gates_passed_list[i]
+        alpha = 0.7
+
+        ax1.plot(traj[:, 0], traj[:, 1], color=color, alpha=alpha, linewidth=1.2)
+        ax1.plot(traj[0, 0], traj[0, 1], 'o', color=color, markersize=5, zorder=4)
+        ax1.plot(traj[-1, 0], traj[-1, 1], 'x', color=color, markersize=7, zorder=4)
+
+        ax2.plot(traj[:, 0], traj[:, 2], color=color, alpha=alpha, linewidth=1.2)
+
+    # Legend: one entry per starting gate with stats
+    from collections import defaultdict
+    gate_stats = defaultdict(list)
+    for i, sg in enumerate(start_gates):
+        gate_stats[sg].append(gates_passed_list[i])
+
+    legend_handles = []
+    for gi in sorted(gate_stats.keys()):
+        gps = gate_stats[gi]
+        color = cmap(gi / max(num_gates, 1))
+        avg_gp = np.mean(gps)
+        max_gp = max(gps)
+        line = plt.Line2D([0], [0], color=color, linewidth=2,
+                          label=f'G{gi+1}: avg {avg_gp:.1f}, max {max_gp} gates')
+        legend_handles.append(line)
+
+    total_gp = sum(gates_passed_list)
+    avg_all = total_gp / max(len(trajectories), 1)
+    ax1.set_title(f'Per-Gate Eval: {track_name} ({num_gates} gates) — '
+                  f'{len(trajectories)} runs, avg {avg_all:.2f} gates/run',
+                  fontsize=13)
+    ax1.set_xlabel('X (m)')
+    ax1.set_ylabel('Y (m)')
+    ax1.set_aspect('equal')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(handles=legend_handles, fontsize=8, loc='upper left')
+
+    ax2.set_title('Side View (X-Z, NED: negative Z = up)', fontsize=13)
+    ax2.set_xlabel('X (m)')
+    ax2.set_ylabel('Z (m)')
+    ax2.invert_yaxis()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path is None:
+        save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                                 f'eval_{track_name}_pergate.png')
+    plt.savefig(save_path, dpi=150)
+    print(f"Saved to {os.path.abspath(save_path)}")
+    plt.close()
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -216,9 +347,22 @@ if __name__ == "__main__":
     parser.add_argument("--max-steps", type=int, default=4000)
     parser.add_argument("--all-tracks", action="store_true",
                         help="Evaluate on all available tracks")
+    parser.add_argument("--per-gate", action="store_true",
+                        help="Spawn from each gate (runs-per-gate episodes per gate)")
+    parser.add_argument("--runs-per-gate", type=int, default=4)
+    parser.add_argument("--gate-size", type=float, default=0.5,
+                        help="Gate size for eval (default: 0.5 = training final)")
     args = parser.parse_args()
 
-    if args.all_tracks:
+    if args.per_gate:
+        track = args.track or config.ACTIVE_TRACK
+        print(f"Per-gate eval: {args.checkpoint} on '{track}' "
+              f"({args.runs_per_gate} runs/gate, gate size {args.gate_size}m)...")
+        trajs, gp, sg, tg, tn = evaluate_per_gate(
+            args.checkpoint, track, args.vecnorm,
+            args.runs_per_gate, args.max_steps, args.gate_size)
+        plot_eval_per_gate(trajs, gp, sg, tg, tn)
+    elif args.all_tracks:
         for name in config.TRACKS:
             print(f"\n{'='*60}")
             print(f"Evaluating on track: {name} ({len(config.TRACKS[name])} gates)")
