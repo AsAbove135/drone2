@@ -31,17 +31,25 @@ def load_csv(csv_path):
                 rows.append([float(x) for x in line.split(',')])
     if not rows:
         print("No data rows found in CSV.")
-        sys.exit(1)
+        return None, header
     data = {}
     for i, col in enumerate(header):
         data[col] = np.array([r[i] for r in rows])
     return data, header
 
 
+def _get(data, *keys):
+    """Get first matching key from data dict."""
+    for k in keys:
+        if k in data:
+            return data[k]
+    raise KeyError(f"None of {keys} found in data")
+
+
 def plot_reward(data, out_dir):
     fig, ax = plt.subplots(figsize=(12, 5))
     steps = data['steps'] / 1e6
-    ax.plot(steps, data['reward_mean'], 'b-', linewidth=1.5)
+    ax.plot(steps, _get(data, 'reward_mean', 'reward'), 'b-', linewidth=1.5)
     ax.set_xlabel('Training Steps (M)')
     ax.set_ylabel('Mean Episode Reward')
     ax.set_title('Episode Reward Over Training')
@@ -159,6 +167,47 @@ def plot_ppo_stats(data, out_dir):
     return True
 
 
+def plot_gpu_stats(data, out_dir):
+    """Plot PPO stats from GPU trainer CSV columns."""
+    needed = ['entropy', 'clip_frac', 'pg_loss', 'v_loss']
+    if not all(k in data for k in needed):
+        return False
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    steps = data['steps'] / 1e6
+
+    ax = axes[0, 0]
+    ax.plot(steps, data['entropy'], 'purple', linewidth=1.5)
+    ax.set_ylabel('Entropy')
+    ax.set_title('Policy Entropy')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[0, 1]
+    ax.plot(steps, data['clip_frac'], 'red', linewidth=1.5)
+    ax.set_ylabel('Clip Fraction')
+    ax.set_title('PPO Clip Fraction')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 0]
+    ax.plot(steps, data['pg_loss'], 'blue', linewidth=1.5)
+    ax.set_xlabel('Training Steps (M)')
+    ax.set_ylabel('Policy Loss')
+    ax.set_title('Policy Gradient Loss')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 1]
+    ax.plot(steps, data['v_loss'], 'orange', linewidth=1.5)
+    ax.set_xlabel('Training Steps (M)')
+    ax.set_ylabel('Value Loss')
+    ax.set_title('Value Function Loss')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, 'gpu_ppo_stats.png'), dpi=150)
+    plt.close()
+    return True
+
+
 def generate_charts(csv_path, out_dir, run_name=None):
     """Generate all charts from a training CSV."""
     if run_name is None:
@@ -168,19 +217,32 @@ def generate_charts(csv_path, out_dir, run_name=None):
     os.makedirs(chart_dir, exist_ok=True)
 
     data, header = load_csv(csv_path)
+    if data is None:
+        return chart_dir
     print(f"Loaded {len(data['steps'])} data points from {csv_path}")
     print(f"Steps range: {data['steps'][0]:,.0f} — {data['steps'][-1]:,.0f}")
 
     plot_reward(data, chart_dir)
     print(f"  Saved reward.png")
-    plot_avg_gates(data, chart_dir)
-    print(f"  Saved avg_gates.png")
-    plot_gate_distribution(data, header, chart_dir)
-    print(f"  Saved gate_distribution.png")
-    plot_curriculum(data, chart_dir)
-    print(f"  Saved curriculum.png")
+
+    if 'avg_gates' in data:
+        plot_avg_gates(data, chart_dir)
+        print(f"  Saved avg_gates.png")
+
+    pct_cols = [c for c in header if c.startswith('pct_ge_')]
+    if pct_cols:
+        plot_gate_distribution(data, header, chart_dir)
+        print(f"  Saved gate_distribution.png")
+
+    if 'gate_size' in data:
+        plot_curriculum(data, chart_dir)
+        print(f"  Saved curriculum.png")
+
     if plot_ppo_stats(data, chart_dir):
         print(f"  Saved ppo_stats.png")
+
+    if plot_gpu_stats(data, chart_dir):
+        print(f"  Saved gpu_ppo_stats.png")
 
     print(f"\nAll charts saved to: {os.path.abspath(chart_dir)}")
     return chart_dir

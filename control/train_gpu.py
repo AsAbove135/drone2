@@ -28,6 +28,8 @@ class ActorCritic(nn.Module):
             nn.Linear(64, act_dim),
         )
         self.actor_log_std = nn.Parameter(torch.zeros(act_dim))
+        self.log_std_min = -2.0
+        self.log_std_max = 0.5  # Will be decayed during training
 
         self.critic = nn.Sequential(
             nn.Linear(obs_dim, 64), nn.ReLU(),
@@ -48,7 +50,7 @@ class ActorCritic(nn.Module):
 
     def forward(self, obs):
         mean = self.actor_mean(obs)
-        std = self.actor_log_std.clamp(-2.0, 0.5).exp().expand_as(mean)
+        std = self.actor_log_std.clamp(self.log_std_min, self.log_std_max).exp().expand_as(mean)
         value = self.critic(obs).squeeze(-1)
         return mean, std, value
 
@@ -156,7 +158,10 @@ def train(
     gamma=0.99,             # SB3 default
     gae_lambda=0.95,        # SB3 default
     clip_range=0.2,         # SB3 default
-    ent_coef=0.003,         # Small entropy bonus to prevent premature convergence
+    ent_coef_start=0.01,    # Entropy coef decays linearly over training
+    ent_coef_end=0.001,     # Final entropy coef (precision phase)
+    log_std_max_start=0.5,  # Action std upper bound decays over training
+    log_std_max_end=-1.0,   # Final upper bound: max std ≈ 0.37
     vf_coef=0.5,            # SB3 default
     max_grad_norm=0.5,      # SB3 default
     vf_clip_range=None,     # SB3 default (no VF clipping)
@@ -218,6 +223,11 @@ def train(
     global_step = 0
     start_time = time.time()
 
+    # CSV logging
+    csv_path = os.path.join(save_dir, "training_stats.csv")
+    with open(csv_path, 'w') as f:
+        f.write("steps,reward,pg_loss,v_loss,entropy,clip_frac,lr,ent_coef,log_std_max,difficulty,gates_passed,episodes,pass_rate,fps\n")
+
     print(f"Iterations: {num_iterations}, steps/iter: {num_envs * n_steps:,}")
     print("-" * 70)
 
@@ -233,6 +243,13 @@ def train(
         frac = 1.0 - (iteration - 1) / num_iterations
         for pg in optimizer.param_groups:
             pg['lr'] = lr * frac
+
+        # ── Entropy coefficient decay ──
+        progress = (iteration - 1) / max(num_iterations - 1, 1)
+        ent_coef = ent_coef_start + (ent_coef_end - ent_coef_start) * progress
+
+        # ── Action std decay (tighten upper clamp bound) ──
+        policy.log_std_max = log_std_max_start + (log_std_max_end - log_std_max_start) * progress
 
         # ── Collect rollouts ──
         policy.eval()
@@ -333,20 +350,35 @@ def train(
             extra = f"Gates: {gates_passed}/{eps_ended} ({pass_rate:.1%})"
             env.gates_passed_count = 0
             env.episodes_ended_count = 0
+            avg_pg = sum(pg_losses)/len(pg_losses)
+            avg_vl = sum(v_losses)/len(v_losses)
+            avg_ent = sum(ent_losses)/len(ent_losses)
+            avg_clip = sum(clip_fracs)/len(clip_fracs)
+            cur_lr = optimizer.param_groups[0]['lr']
+
             print(
                 f"Iter {iteration:5d}/{num_iterations} | "
                 f"Steps: {global_step:>12,} | "
                 f"FPS: {fps:>8,.0f} | "
                 f"Reward: {avg_reward:>8.3f} | "
-                f"PG Loss: {sum(pg_losses)/len(pg_losses):.4f} | "
-                f"V Loss: {sum(v_losses)/len(v_losses):.4f} | "
-                f"Entropy: {sum(ent_losses)/len(ent_losses):.3f} | "
-                f"Clip: {sum(clip_fracs)/len(clip_fracs):.3f} | "
-                f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
+                f"PG Loss: {avg_pg:.4f} | "
+                f"V Loss: {avg_vl:.4f} | "
+                f"Entropy: {avg_ent:.3f} | "
+                f"Clip: {avg_clip:.3f} | "
+                f"LR: {cur_lr:.2e} | "
+                f"EntC: {ent_coef:.4f} | "
+                f"StdMax: {policy.log_std_max:.2f} | "
                 f"Diff: {difficulty:.2f} | "
                 f"{extra}",
                 flush=True,
             )
+
+            # Write CSV row
+            with open(csv_path, 'a') as f:
+                f.write(f"{global_step},{avg_reward:.4f},{avg_pg:.6f},{avg_vl:.6f},"
+                        f"{avg_ent:.4f},{avg_clip:.4f},{cur_lr:.6f},{ent_coef:.6f},"
+                        f"{policy.log_std_max:.4f},{difficulty:.4f},"
+                        f"{gates_passed},{eps_ended},{pass_rate:.6f},{fps:.0f}\n")
 
         # ── Checkpoints ──
         if iteration % 100 == 0:
@@ -357,6 +389,8 @@ def train(
                 'obs_norm_mean': obs_norm.mean,
                 'obs_norm_var': obs_norm.var,
                 'global_step': global_step,
+                'ent_coef': ent_coef,
+                'log_std_max': policy.log_std_max,
             }, ckpt_path)
 
     # Save final

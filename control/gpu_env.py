@@ -15,6 +15,7 @@ from config import (
     K_P, K_Q, K_R_SPEED, K_R_ACCEL, J_X, J_Y, J_Z,
     MOTOR_TAU, MOTOR_K_CMD, MOTOR_OMEGA_MIN, MOTOR_OMEGA_MAX,
     GRAVITY, OBS_DIM,
+    LAMBDA_PROG, LAMBDA_GATE, LAMBDA_ALIGN,
     LAMBDA_RATE, LAMBDA_OFFSET,
     LAMBDA_PERC, LAMBDA_CRASH, V_MAX,
     GATE_POSITIONS, GATE_SIZE, NUM_LAPS, NUM_GATES,
@@ -25,11 +26,8 @@ from config import (
     H_GROUND, V_GROUND, OMEGA_MAX_TERMINATION,
 )
 
-# GPU experimental overrides (differ from paper values in config.py)
-DT_SIM = 0.005          # higher fidelity than paper's 0.01
-LAMBDA_PROG = 1.5       # boosted from paper's 1.0
-LAMBDA_GATE = 10.0      # boosted from paper's 1.5
-LAMBDA_ALIGN = 10.0     # trajectory alignment (not in paper)
+# GPU overrides
+DT_SIM = 0.01           # paper value — gives 40s episodes with MAX_EPISODE_STEPS=4000
 
 
 # ── Batched quaternion/euler helpers ──────────────────────────────

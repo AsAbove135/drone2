@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import numpy as np
@@ -501,7 +502,8 @@ class MonoRaceSimEnv(gym.Env):
         return obs, float(reward), terminated, truncated, info
 
 
-def train_ppo(near_gate_spawn=True):
+def train_ppo(near_gate_spawn=True, ent_coef_start=0.01, ent_coef_end=0.001,
+              log_std_max_start=0.5, log_std_max_end=-1.0):
     """Train M23 policy with PPO via Stable Baselines 3."""
     import shutil
     from stable_baselines3 import PPO
@@ -620,6 +622,64 @@ def train_ppo(near_gate_spawn=True):
                 self._ep_rewards = []
             return True
 
+    class EntropyStdDecayCallback(BaseCallback):
+        """Linearly decay entropy coefficient and action std upper bound over training."""
+        def __init__(self, total_timesteps, ent_start, ent_end, std_max_start, std_max_end, **kwargs):
+            super().__init__(verbose=0)
+            self._total = total_timesteps
+            self._ent_start = ent_start
+            self._ent_end = ent_end
+            self._std_max_start = std_max_start
+            self._std_max_end = std_max_end
+            self._last_log = 0
+
+        def _on_step(self):
+            progress = min(1.0, self.num_timesteps / self._total)
+
+            # Decay entropy coefficient
+            self.model.ent_coef = self._ent_start + (self._ent_end - self._ent_start) * progress
+
+            # Decay action std upper bound by clamping log_std
+            log_std_max = self._std_max_start + (self._std_max_end - self._std_max_start) * progress
+            with torch.no_grad():
+                log_std = self.model.policy.log_std
+                log_std.clamp_(min=-2.0, max=log_std_max)
+
+            # Log every 100K steps
+            if self.num_timesteps - self._last_log >= 100_000:
+                self._last_log = self.num_timesteps
+                self.logger.record("decay/ent_coef", self.model.ent_coef)
+                self.logger.record("decay/log_std_max", log_std_max)
+                self.logger.record("decay/log_std_mean", log_std.mean().item())
+                print(f"  [Decay] EntC: {self.model.ent_coef:.4f} | "
+                      f"StdMax: {log_std_max:.2f} | "
+                      f"LogStd: {log_std.data.tolist()}",
+                      flush=True)
+            return True
+
+    class PeriodicPlotCallback(BaseCallback):
+        """Regenerate result plots every N seconds during training."""
+        def __init__(self, csv_path, results_dir, run_name, interval_sec=300, **kwargs):
+            super().__init__(verbose=0)
+            self._csv_path = csv_path
+            self._results_dir = results_dir
+            self._run_name = run_name
+            self._interval = interval_sec
+            self._last_plot_time = 0
+
+        def _on_step(self):
+            now = time.time()
+            if now - self._last_plot_time >= self._interval:
+                self._last_plot_time = now
+                try:
+                    from control.plot_training import generate_charts
+                    generate_charts(self._csv_path, self._results_dir, self._run_name)
+                    print(f"  [Plots] Updated charts in {self._results_dir}/{self._run_name}/",
+                          flush=True)
+                except Exception as e:
+                    print(f"  [Plots] Failed: {e}", flush=True)
+            return True
+
     save_dir = "D:/drone2_training/latest"
 
     # Wipe previous run data
@@ -663,7 +723,7 @@ def train_ppo(near_gate_spawn=True):
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=ent_coef_start,
         verbose=1,
         device="cpu",
         tensorboard_log=os.path.join(save_dir, "tb_logs"),
@@ -694,20 +754,44 @@ def train_ppo(near_gate_spawn=True):
     )
     csv_log_path = os.path.join(save_dir, "training_stats.csv")
     gate_cb = GateCurriculumCallback(csv_path=csv_log_path)
+    decay_cb = EntropyStdDecayCallback(
+        total_timesteps=TOTAL_TIMESTEPS,
+        ent_start=ent_coef_start, ent_end=ent_coef_end,
+        std_max_start=log_std_max_start, std_max_end=log_std_max_end,
+    )
+
+    results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results_tracking')
+    from datetime import datetime
+    run_name = datetime.now().strftime("%Y-%m-%d_%H-%M") + "_ent_decay_std_decay"
+
+    plot_cb = PeriodicPlotCallback(
+        csv_path=csv_log_path, results_dir=results_dir,
+        run_name=run_name, interval_sec=300,
+    )
 
     print(f"Starting PPO Training ({TOTAL_TIMESTEPS:,} timesteps, {NUM_ENVS} envs)...")
+    print(f"Entropy decay: {ent_coef_start} -> {ent_coef_end}")
+    print(f"Std decay: log_std_max {log_std_max_start} -> {log_std_max_end}")
+    print(f"Plots updating every 5 min to: results_tracking/{run_name}/")
     print(f"Curriculum: gate {GateCurriculumCallback.GATE_START}m -> {GateCurriculumCallback.GATE_END}m, "
           f"spawn 2-{GateCurriculumCallback.DIST_MAX_START}m -> 2-{GateCurriculumCallback.DIST_MAX_END}m, "
           f"full by {GateCurriculumCallback.CURRICULUM_STEPS/1e6:.0f}M steps")
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
-        callback=[checkpoint_cb, vecnorm_cb, gate_cb],
+        callback=[checkpoint_cb, vecnorm_cb, gate_cb, decay_cb, plot_cb],
     )
 
     model.save(os.path.join(save_dir, "gcnet_m23_final"))
     env.save(os.path.join(save_dir, "vecnormalize_m23.pkl"))
     print(f"Training complete. Model saved to {save_dir}")
     print('To keep this run: python control/save_run.py "description"')
+
+    # Final plot generation
+    try:
+        from control.plot_training import generate_charts
+        generate_charts(csv_log_path, results_dir, run_name)
+    except Exception as e:
+        print(f"Warning: final auto-plot failed: {e}")
 
 
 def resume_training(checkpoint_path, total_remaining=10_000_000, near_gate_spawn=True):
