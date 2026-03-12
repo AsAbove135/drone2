@@ -1,0 +1,153 @@
+{
+  "experiment": "fsppo_fs16_multitrack_200M",
+  "checkpoint": "D:/drone2_training/fsppo_fs16_multitrack/fsppo_m23_randseg_final.pt",
+  "model_type": "fsppo",
+  "global_step": 200278016,
+  "tracks": {
+    "kidney": {
+      "episodes": [
+        {
+          "gates_passed": 20,
+          "steps": 865,
+          "sim_time_s": 8.65,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 862,
+          "sim_time_s": 8.62,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 861,
+          "sim_time_s": 8.61,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 862,
+          "sim_time_s": 8.62,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 863,
+          "sim_time_s": 8.63,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 862,
+          "sim_time_s": 8.62,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 863,
+          "sim_time_s": 8.63,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 864,
+          "sim_time_s": 8.64,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 866,
+          "sim_time_s": 8.66,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 864,
+          "sim_time_s": 8.64,
+          "completed": true
+        }
+      ],
+      "avg_gates": 20.0,
+      "max_gates": 20,
+      "pct_ge_1": 100.0,
+      "pct_ge_5": 100.0,
+      "pct_ge_10": 100.0,
+      "completions": 10,
+      "avg_completion_time_s": 8.63,
+      "best_completion_time_s": 8.61
+    },
+    "figure8": {
+      "episodes": [
+        {
+          "gates_passed": 20,
+          "steps": 1165,
+          "sim_time_s": 11.65,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1164,
+          "sim_time_s": 11.64,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1167,
+          "sim_time_s": 11.67,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1168,
+          "sim_time_s": 11.68,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1170,
+          "sim_time_s": 11.7,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1166,
+          "sim_time_s": 11.66,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1169,
+          "sim_time_s": 11.69,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1169,
+          "sim_time_s": 11.69,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1168,
+          "sim_time_s": 11.68,
+          "completed": true
+        },
+        {
+          "gates_passed": 20,
+          "steps": 1165,
+          "sim_time_s": 11.65,
+          "completed": true
+        }
+      ],
+      "avg_gates": 20.0,
+      "max_gates": 20,
+      "pct_ge_1": 100.0,
+      "pct_ge_5": 100.0,
+      "pct_ge_10": 100.0,
+      "completions": 10,
+      "avg_completion_time_s": 11.67,
+      "best_completion_time_s": 11.64
+    }
+  },
+  "frame_stack": 16
+}
