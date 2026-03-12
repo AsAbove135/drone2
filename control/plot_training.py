@@ -173,7 +173,9 @@ def plot_gpu_stats(data, out_dir):
     if not all(k in data for k in needed):
         return False
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    has_lr = 'lr' in data
+    nrows = 3 if has_lr else 2
+    fig, axes = plt.subplots(nrows, 2, figsize=(16, 5 * nrows))
     steps = data['steps'] / 1e6
 
     ax = axes[0, 0]
@@ -190,20 +192,115 @@ def plot_gpu_stats(data, out_dir):
 
     ax = axes[1, 0]
     ax.plot(steps, data['pg_loss'], 'blue', linewidth=1.5)
-    ax.set_xlabel('Training Steps (M)')
     ax.set_ylabel('Policy Loss')
     ax.set_title('Policy Gradient Loss')
     ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
     ax.plot(steps, data['v_loss'], 'orange', linewidth=1.5)
-    ax.set_xlabel('Training Steps (M)')
     ax.set_ylabel('Value Loss')
     ax.set_title('Value Function Loss')
     ax.grid(True, alpha=0.3)
 
+    if has_lr:
+        ax = axes[2, 0]
+        ax.plot(steps, data['lr'], 'green', linewidth=1.5)
+        ax.set_xlabel('Training Steps (M)')
+        ax.set_ylabel('Learning Rate')
+        ax.set_title('Learning Rate Schedule')
+        ax.ticklabel_format(axis='y', style='scientific', scilimits=(-4, -4))
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[2, 1]
+        if 'fps' in data:
+            ax.plot(steps, data['fps'], 'teal', linewidth=1.5)
+            ax.set_ylabel('FPS')
+            ax.set_title('Training Speed (FPS)')
+        else:
+            ax.set_visible(False)
+        ax.set_xlabel('Training Steps (M)')
+        ax.grid(True, alpha=0.3)
+
+    # Add x-labels to bottom row
+    if not has_lr:
+        axes[1, 0].set_xlabel('Training Steps (M)')
+        axes[1, 1].set_xlabel('Training Steps (M)')
+
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, 'gpu_ppo_stats.png'), dpi=150)
+    plt.close()
+    return True
+
+
+def plot_reward_components(data, out_dir):
+    """Plot individual reward components over training."""
+    components = [
+        ('r_prog', 'Progress', 'green'),
+        ('r_gate', 'Gate', 'blue'),
+        ('r_offset', 'Offset', 'cyan'),
+        ('r_rate', 'Ang Rate', 'red'),
+        ('r_perc', 'Perception', 'orange'),
+        ('r_align', 'Alignment', 'purple'),
+    ]
+    available = [(key, label, color) for key, label, color in components if key in data]
+    if not available:
+        return False
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    steps = data['steps'] / 1e6
+
+    # Top: all components stacked
+    ax = axes[0]
+    for key, label, color in available:
+        ax.plot(steps, data[key], color=color, linewidth=1.2, label=label)
+    ax.set_ylabel('Reward per Step (per env)')
+    ax.set_title('Reward Components Over Training')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+
+    # Bottom: penalties only (rate, perc, offset) zoomed in
+    penalty_keys = [c for c in available if c[0] in ('r_rate', 'r_perc', 'r_offset')]
+    ax = axes[1]
+    for key, label, color in penalty_keys:
+        ax.plot(steps, data[key], color=color, linewidth=1.2, label=label)
+    # Also show progress for context
+    if 'r_prog' in data:
+        ax.plot(steps, data['r_prog'], color='green', linewidth=1.2, alpha=0.4, label='Progress')
+    ax.set_xlabel('Training Steps (M)')
+    ax.set_ylabel('Reward per Step (per env)')
+    ax.set_title('Penalties & Progress (zoomed)')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, 'reward_components.png'), dpi=150)
+    plt.close()
+    return True
+
+
+def plot_segment_pass_rates(data, header, out_dir):
+    """Plot per-segment gate pass rates over training."""
+    seg_cols = [c for c in header if c.startswith('seg_') and c.endswith('_pass_rate')]
+    if not seg_cols:
+        return False
+    steps = data['steps'] / 1e6
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    cmap = plt.cm.tab10
+    for i, col in enumerate(seg_cols):
+        seg_num = int(col.split('_')[1])
+        color = cmap(i / max(len(seg_cols) - 1, 1))
+        ax.plot(steps, data[col], color=color, linewidth=1.5, label=f'Seg {seg_num} (gate {seg_num}→{seg_num+1})')
+
+    ax.set_xlabel('Training Steps (M)')
+    ax.set_ylabel('Avg Gates Passed per Episode')
+    ax.set_title('Per-Segment Gate Pass Rate (which transitions are hardest?)')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=7, loc='upper left', ncol=2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, 'segment_pass_rates.png'), dpi=150)
     plt.close()
     return True
 
@@ -243,6 +340,12 @@ def generate_charts(csv_path, out_dir, run_name=None):
 
     if plot_gpu_stats(data, chart_dir):
         print(f"  Saved gpu_ppo_stats.png")
+
+    if plot_reward_components(data, chart_dir):
+        print(f"  Saved reward_components.png")
+
+    if plot_segment_pass_rates(data, header, chart_dir):
+        print(f"  Saved segment_pass_rates.png")
 
     print(f"\nAll charts saved to: {os.path.abspath(chart_dir)}")
     return chart_dir

@@ -1,6 +1,6 @@
 """
-Evaluate a trained GPU RPPO policy on the kidney track.
-Runs full episodes from behind gate 1, reports gates passed per episode, plots trajectories.
+Evaluate a trained GPU Mamba-PPO policy on the kidney track.
+Runs full episodes, reports gates passed per episode, plots trajectories.
 """
 import os
 import sys
@@ -12,9 +12,9 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from control_rppo.train_gpu_rppo import RecurrentActorCritic, RunningNorm
+from control_mamba.train_gpu_mamba import MambaActorCritic, RunningNorm
 from control.gpu_env import BatchedDroneEnv
-from config import OBS_DIM, GATE_POSITIONS, NUM_LAPS, ACTIVE_TRACK, TRACKS, MAX_EPISODE_STEPS
+from config import OBS_DIM, GATE_POSITIONS, NUM_LAPS, ACTIVE_TRACK, MAX_EPISODE_STEPS
 
 
 def evaluate(
@@ -25,81 +25,72 @@ def evaluate(
 ):
     device = torch.device(device)
 
-    # Load checkpoint
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"  Global step: {ckpt.get('global_step', 'unknown')}")
 
-    # Reconstruct policy
-    policy = RecurrentActorCritic(obs_dim=OBS_DIM, act_dim=4, lstm_hidden=128, n_lstm_layers=1).to(device)
+    policy = MambaActorCritic(obs_dim=OBS_DIM, act_dim=4).to(device)
     policy.load_state_dict(ckpt['policy_state_dict'])
     policy.eval()
 
-    # Observation normalizer
     obs_norm = RunningNorm(OBS_DIM, device)
     obs_norm.mean = ckpt['obs_norm_mean'].to(device)
     obs_norm.var = ckpt['obs_norm_var'].to(device)
 
-    # Create env with 1 env for sequential evaluation
-    # We'll use the batched env but with num_envs=num_episodes to run them in parallel
     env = BatchedDroneEnv(
         num_envs=num_episodes, device=device,
-        fixed_start=True,  # We'll manually set positions
+        fixed_start=True,
         domain_randomize=False,
         single_gate=False,
         random_segments=False,
     )
 
-    # Reset and collect trajectories
     obs = env.reset_all()
     obs = obs_norm.normalize(obs)
-    actor_hc, critic_hc = policy.initial_state(num_episodes, device)
+    actor_states, critic_states = policy.initial_state(num_episodes, device)
 
     trajectories = [[] for _ in range(num_episodes)]
     max_gate_idx = torch.zeros(num_episodes, device=device, dtype=torch.long)
     episode_done = torch.zeros(num_episodes, device=device, dtype=torch.bool)
 
-    # Record initial positions
     positions = env.states[:, 0:3].cpu().numpy()
     for i in range(num_episodes):
         trajectories[i].append(positions[i].copy())
 
     with torch.no_grad():
         for step in range(max_steps):
-            # Track max gate_idx BEFORE stepping (env resets gate_idx on done)
             still_running = ~episode_done
             max_gate_idx = torch.where(still_running, torch.max(max_gate_idx, env.gate_idx), max_gate_idx)
 
-            mean, std, value, actor_hc, critic_hc = policy.forward_single(obs, actor_hc, critic_hc)
-            # Deterministic: use mean action
+            mean, std, value, actor_states, critic_states = \
+                policy.forward_single(obs, actor_states, critic_states)
             action = torch.sigmoid(mean)
 
             next_obs, rewards, dones = env.step(action)
             next_obs = obs_norm.normalize(next_obs)
 
-            # Track max gate_idx after step too (catches the final gate passage before done)
             max_gate_idx = torch.where(still_running, torch.max(max_gate_idx, env.gate_idx), max_gate_idx)
 
-            # Track trajectories for non-done episodes
             positions = env.states[:, 0:3].cpu().numpy()
             for i in range(num_episodes):
                 if not episode_done[i]:
                     trajectories[i].append(positions[i].copy())
 
-            # Mark newly done episodes
             episode_done = episode_done | dones
 
-            # Reset hidden states for done episodes
-            done_mask = dones.float().unsqueeze(0).unsqueeze(-1)
-            actor_hc = (actor_hc[0] * (1.0 - done_mask), actor_hc[1] * (1.0 - done_mask))
-            critic_hc = (critic_hc[0] * (1.0 - done_mask), critic_hc[1] * (1.0 - done_mask))
+            if dones.any():
+                done_mask = dones.unsqueeze(-1).unsqueeze(-1)
+                for layer in range(len(actor_states)):
+                    ssm, conv = actor_states[layer]
+                    actor_states[layer] = (ssm * (1.0 - done_mask), conv * (1.0 - done_mask))
+                    ssm, conv = critic_states[layer]
+                    critic_states[layer] = (ssm * (1.0 - done_mask), conv * (1.0 - done_mask))
 
             obs = next_obs
 
             if episode_done.all():
                 break
 
-    # Convert to numpy
     gates_passed_np = max_gate_idx.cpu().numpy()
     num_gates = len(GATE_POSITIONS)
     total_target = num_gates * NUM_LAPS
@@ -129,7 +120,6 @@ def plot_trajectories(trajectories, gates_passed_np, save_path=None):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 12))
     cmap = plt.cm.tab10
 
-    # Draw gates
     half = 0.5
     for i in range(num_gates):
         cx, cy, cz, yaw = track_gates[i]
@@ -159,7 +149,7 @@ def plot_trajectories(trajectories, gates_passed_np, save_path=None):
 
     total_target = num_gates * NUM_LAPS
     avg_gp = gates_passed_np.mean()
-    ax1.set_title(f'RPPO Eval: {ACTIVE_TRACK} ({num_gates} gates x {NUM_LAPS} laps = {total_target}) — '
+    ax1.set_title(f'Mamba-PPO Eval: {ACTIVE_TRACK} ({num_gates} gates x {NUM_LAPS} laps = {total_target}) — '
                   f'avg {avg_gp:.1f} gates', fontsize=13)
     ax1.set_xlabel('X (m)')
     ax1.set_ylabel('Y (m)')
@@ -176,7 +166,7 @@ def plot_trajectories(trajectories, gates_passed_np, save_path=None):
     plt.tight_layout()
     if save_path is None:
         save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
-                                 'results_tracking', 'rppo_eval.png')
+                                 'results_tracking', 'mamba_eval.png')
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, dpi=150)
     print(f"Saved trajectory plot to {os.path.abspath(save_path)}")
@@ -185,9 +175,9 @@ def plot_trajectories(trajectories, gates_passed_np, save_path=None):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Evaluate GPU RPPO policy")
+    parser = argparse.ArgumentParser(description="Evaluate GPU Mamba-PPO policy")
     parser.add_argument("--checkpoint", type=str,
-                        default="D:/drone2_training/rppo_latest/rppo_m23_randseg_final.pt")
+                        default="D:/drone2_training/mamba_latest/mamba_m23_randseg_final.pt")
     parser.add_argument("--episodes", type=int, default=16)
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()

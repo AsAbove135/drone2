@@ -24,6 +24,7 @@ from config import (
     INIT_RP_RANGE, INIT_YAW_RANGE, INIT_OMEGA_RANGE,
     BOUNDS_X, BOUNDS_Y, BOUNDS_Z,
     H_GROUND, V_GROUND, OMEGA_MAX_TERMINATION,
+    TRACKS,
 )
 
 # GPU overrides
@@ -200,7 +201,9 @@ class BatchedDroneEnv:
     """
     def __init__(self, num_envs=2048, device="cuda", fixed_start=False,
                  domain_randomize=True, single_gate=False, gate_size_override=None,
-                 random_segments=False):
+                 random_segments=False, lambda_prog=None, lambda_gate=None,
+                 lambda_gate_inc=None, lambda_rate=None, gate_positions=None,
+                 track_names=None):
         self.N = num_envs
         self.device = torch.device(device)
         self.dt = DT_SIM
@@ -210,43 +213,93 @@ class BatchedDroneEnv:
         self.domain_randomize = domain_randomize
         self.single_gate = single_gate
         self.random_segments = random_segments
-        if random_segments:
-            self.single_gate = True  # each env does one gate passage
         self.gate_size = gate_size_override if gate_size_override is not None else GATE_SIZE
+        # Gate positions: use provided or default from config
+        active_gate_positions = gate_positions if gate_positions is not None else GATE_POSITIONS
+        self.num_gates = len(active_gate_positions)
         # Segment training: (from_gate_idx, to_gate_idx) or None
         self.segment = None
         # Gate passage tracking
         self.gates_passed_count = 0
         self.episodes_ended_count = 0
+        # Per-episode gate tracking for distribution stats
+        self.ep_gate_start = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self.ep_gates_list = []  # collects per-episode gate counts
+        # Per-segment tracking: for each starting segment, track (gates_passed, episodes)
+        self.ep_start_segment = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self.segment_gates = [0] * self.num_gates   # total gates passed per starting segment
+        self.segment_episodes = [0] * self.num_gates  # total episodes per starting segment
+        # Reward component accumulators (sum across steps, reset by trainer)
+        self.reward_components = {
+            'prog': 0.0, 'gate': 0.0, 'offset': 0.0,
+            'rate': 0.0, 'perc': 0.0, 'align': 0.0,
+        }
+        # Overridable reward lambdas (default to config values)
+        self.lambda_prog = lambda_prog if lambda_prog is not None else LAMBDA_PROG
+        self.lambda_gate = lambda_gate if lambda_gate is not None else LAMBDA_GATE
+        self.lambda_gate_inc = lambda_gate_inc if lambda_gate_inc is not None else 0.0
+        self.lambda_rate = lambda_rate if lambda_rate is not None else LAMBDA_RATE
 
-        # Precompute gate data as tensors
-        gp = torch.tensor([[g[0], g[1], g[2]] for g in GATE_POSITIONS],
-                          dtype=torch.float32, device=self.device)  # [G, 3]
-        gy = torch.tensor([g[3] for g in GATE_POSITIONS],
-                          dtype=torch.float32, device=self.device)  # [G]
-        self.gates_pos = gp
-        self.gates_yaw = gy
-        self.gates_normal = torch.stack([torch.cos(gy), torch.sin(gy),
-                                         torch.zeros_like(gy)], dim=-1)  # [G, 3]
+        # Multi-track support
+        self.multi_track = track_names is not None and len(track_names) > 1
+        self.arange_N = torch.arange(num_envs, device=self.device)
 
-        # Precompute inverse rotation matrices for each gate
-        R_inv = torch.zeros((NUM_GATES, 3, 3), device=self.device)
-        for i in range(NUM_GATES):
-            c = torch.cos(-gy[i])
-            s = torch.sin(-gy[i])
-            R_inv[i] = torch.tensor([[c, -s, 0], [s, c, 0], [0, 0, 1]],
-                                     device=self.device)
-        self.gates_R_inv = R_inv
+        # Helper to precompute gate data for a single track
+        def _precompute_track(gate_positions_list):
+            G = len(gate_positions_list)
+            gp = torch.tensor([[g[0], g[1], g[2]] for g in gate_positions_list],
+                              dtype=torch.float32, device=self.device)  # [G, 3]
+            gy = torch.tensor([g[3] for g in gate_positions_list],
+                              dtype=torch.float32, device=self.device)  # [G]
+            gn = torch.stack([torch.cos(gy), torch.sin(gy),
+                              torch.zeros_like(gy)], dim=-1)  # [G, 3]
+            R_inv = torch.zeros((G, 3, 3), device=self.device)
+            for i in range(G):
+                c = torch.cos(-gy[i])
+                s = torch.sin(-gy[i])
+                R_inv[i] = torch.tensor([[c, -s, 0], [s, c, 0], [0, 0, 1]],
+                                         device=self.device)
+            ngl = torch.zeros((G, 3), device=self.device)
+            ngyr = torch.zeros(G, device=self.device)
+            for i in range(G):
+                j = (i + 1) % G
+                local = R_inv[i] @ (gp[j] - gp[i])
+                ngl[i] = local
+                yaw_rel = gy[j] - gy[i]
+                ngyr[i] = (yaw_rel + math.pi) % (2 * math.pi) - math.pi
+            return gp, gy, gn, R_inv, ngl, ngyr
 
-        # Precompute next-gate-in-current-frame data
-        self.next_gate_local = torch.zeros((NUM_GATES, 3), device=self.device)
-        self.next_gate_yaw_rel = torch.zeros(NUM_GATES, device=self.device)
-        for i in range(NUM_GATES):
-            j = (i + 1) % NUM_GATES
-            local = R_inv[i] @ (gp[j] - gp[i])
-            self.next_gate_local[i] = local
-            yaw_rel = gy[j] - gy[i]
-            self.next_gate_yaw_rel[i] = (yaw_rel + math.pi) % (2 * math.pi) - math.pi
+        if self.multi_track:
+            self.track_names = track_names
+            self.num_tracks = len(track_names)
+            # Validate all tracks have the same number of gates
+            for tn in track_names:
+                assert len(TRACKS[tn]) == self.num_gates, \
+                    f"Track '{tn}' has {len(TRACKS[tn])} gates, expected {self.num_gates}"
+            # Precompute per-track data: [T, G, ...]
+            track_data = [_precompute_track(TRACKS[tn]) for tn in track_names]
+            self.track_gates_pos = torch.stack([d[0] for d in track_data])       # [T, G, 3]
+            self.track_gates_yaw = torch.stack([d[1] for d in track_data])       # [T, G]
+            self.track_gates_normal = torch.stack([d[2] for d in track_data])    # [T, G, 3]
+            self.track_gates_R_inv = torch.stack([d[3] for d in track_data])     # [T, G, 3, 3]
+            self.track_next_gate_local = torch.stack([d[4] for d in track_data]) # [T, G, 3]
+            self.track_next_gate_yaw_rel = torch.stack([d[5] for d in track_data])  # [T, G]
+            # Per-env track assignment
+            self.env_track = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        else:
+            self.num_tracks = 1
+            self.track_names = None
+
+        # Precompute gate data for single track (or initial track for multi-track)
+        gp, gy, gn, R_inv, ngl, ngyr = _precompute_track(active_gate_positions)
+
+        # Per-env gate tensors: [N, G, ...]
+        self.gates_pos = gp.unsqueeze(0).expand(num_envs, -1, -1).clone()           # [N, G, 3]
+        self.gates_yaw = gy.unsqueeze(0).expand(num_envs, -1).clone()               # [N, G]
+        self.gates_normal = gn.unsqueeze(0).expand(num_envs, -1, -1).clone()        # [N, G, 3]
+        self.gates_R_inv = R_inv.unsqueeze(0).expand(num_envs, -1, -1, -1).clone()  # [N, G, 3, 3]
+        self.next_gate_local = ngl.unsqueeze(0).expand(num_envs, -1, -1).clone()    # [N, G, 3]
+        self.next_gate_yaw_rel = ngyr.unsqueeze(0).expand(num_envs, -1).clone()     # [N, G]
 
         # Environment state
         self.states = torch.zeros((num_envs, 17), device=self.device)
@@ -335,37 +388,45 @@ class BatchedDroneEnv:
         self.env_omega_max[mask] = dr(MOTOR_OMEGA_MAX, DR_OMEGA_MAX)
         self.env_motor_k_cmd[mask] = dr(MOTOR_K_CMD)
 
-    def _random_state(self, n):
+    def _random_state(self, n, env_indices=None):
         """Generate n random initial states with curriculum-based spawning.
+        env_indices: [n] long tensor of which env slots are being reset (for per-env gate lookup).
+                     If None, assumes first n envs (backward compat).
         Returns (state [n, 17], target_gates [n] or None).
         target_gates is set when random_segments is active."""
         dev = self.device
         d = self.difficulty
+        if env_indices is None:
+            env_indices = torch.arange(n, device=dev)
+        ei = env_indices  # shorthand
 
         if self.random_segments:
             # Random segment selection: each env gets a random gate-to-gate segment
             # seg_idx 0 = start->gate0, seg_idx k = gate(k-1)->gate(k)
-            seg_idx = torch.randint(0, NUM_GATES, (n,), device=dev)
+            seg_idx = torch.randint(0, self.num_gates, (n,), device=dev)
             target_gates = seg_idx  # target gate for each env
             is_first = seg_idx == 0
             from_idx = (seg_idx - 1).clamp(min=0)
 
             # Compute spawn centers for seg>0: 1m past from_gate along its normal
-            from_pos = self.gates_pos[from_idx]        # [n, 3]
-            from_normal = self.gates_normal[from_idx]  # [n, 3]
+            from_pos = self.gates_pos[ei, from_idx]        # [n, 3]
+            from_normal = self.gates_normal[ei, from_idx]  # [n, 3]
             spawn_after = from_pos + from_normal * 1.0
 
             # Compute spawn centers for seg==0: 3m before gate 0
-            spawn_before = (self.gates_pos[0] - self.gates_normal[0] * 3.0).unsqueeze(0).expand(n, 3)
+            gate0_pos = self.gates_pos[ei, 0]              # [n, 3]
+            gate0_normal = self.gates_normal[ei, 0]        # [n, 3]
+            spawn_before = gate0_pos - gate0_normal * 3.0
 
             spawn_center = torch.where(is_first.unsqueeze(-1), spawn_before, spawn_after)
 
             # Facing yaw: toward target gate
-            to_pos = self.gates_pos[seg_idx]  # [n, 3]
+            to_pos = self.gates_pos[ei, seg_idx]  # [n, 3]
             diff = to_pos - spawn_center
             facing_yaw_computed = torch.atan2(diff[:, 1], diff[:, 0])
             # For seg==0, use gate 0's yaw directly
-            facing_yaw = torch.where(is_first, self.gates_yaw[0].expand(n), facing_yaw_computed)
+            gate0_yaw = self.gates_yaw[ei, 0]             # [n]
+            facing_yaw = torch.where(is_first, gate0_yaw, facing_yaw_computed)
 
             p = spawn_center.clone()
             p += torch.empty(n, 3, device=dev).uniform_(-0.3, 0.3)
@@ -376,9 +437,11 @@ class BatchedDroneEnv:
             v_small = torch.empty(n, 3, device=dev).uniform_(-0.5, 0.5)
             v = torch.where(is_first.unsqueeze(-1), v_small, v_toward)
 
-            yaw = facing_yaw + torch.empty(n, device=dev).uniform_(-math.radians(5), math.radians(5))
-            roll = torch.empty(n, device=dev).uniform_(-math.radians(5), math.radians(5))
-            pitch = torch.empty(n, device=dev).uniform_(-math.radians(5), math.radians(5))
+            # Yaw jitter: ±90° off target so policy learns to turn/curve toward gates
+            # Roll/pitch: ±20° (matches paper's pi/9) — must stabilize before navigating
+            yaw = facing_yaw + torch.empty(n, device=dev).uniform_(-math.radians(90), math.radians(90))
+            roll = torch.empty(n, device=dev).uniform_(-math.radians(20), math.radians(20))
+            pitch = torch.empty(n, device=dev).uniform_(-math.radians(20), math.radians(20))
 
             euler = torch.stack([roll, pitch, yaw], dim=-1)
             q = batch_euler_to_quat(euler)
@@ -388,6 +451,9 @@ class BatchedDroneEnv:
 
         if self.segment is not None or self.fixed_start:
             # Segment or fixed-start spawning
+            # Note: segment/fixed_start use scalar gate indices — pick from env 0's gates
+            # (all envs on same track when using segment mode, or gates are identical in single-track)
+            ei0 = ei[0]  # representative env for scalar gate lookups
             if self.segment is not None:
                 from_gate, to_gate = self.segment
             else:
@@ -395,18 +461,18 @@ class BatchedDroneEnv:
 
             if from_gate is None:
                 # Start position: 3m before first gate
-                target_pos = self.gates_pos[to_gate]
-                target_yaw = self.gates_yaw[to_gate]
-                target_normal = self.gates_normal[to_gate]
+                target_pos = self.gates_pos[ei0, to_gate]
+                target_yaw = self.gates_yaw[ei0, to_gate]
+                target_normal = self.gates_normal[ei0, to_gate]
                 spawn_center = target_pos - target_normal * 3.0
                 facing_yaw = target_yaw
             else:
                 # Spawn at from_gate exit: 1m past gate along its normal
-                from_pos = self.gates_pos[from_gate]
-                from_normal = self.gates_normal[from_gate]
+                from_pos = self.gates_pos[ei0, from_gate]
+                from_normal = self.gates_normal[ei0, from_gate]
                 spawn_center = from_pos + from_normal * 1.0
                 # Face toward the target gate
-                to_pos = self.gates_pos[to_gate]
+                to_pos = self.gates_pos[ei0, to_gate]
                 diff = to_pos - spawn_center
                 facing_yaw = torch.atan2(diff[1], diff[0])
 
@@ -415,7 +481,7 @@ class BatchedDroneEnv:
             p += torch.empty(n, 3, device=dev).uniform_(-0.3, 0.3)
             # Small initial velocity toward target to help exploration
             if from_gate is not None:
-                to_pos = self.gates_pos[to_gate]
+                to_pos = self.gates_pos[ei0, to_gate]
                 direction = to_pos - spawn_center
                 direction = direction / (direction.norm() + 1e-8)
                 v = direction.unsqueeze(0).expand(n, 3).clone() * 2.0  # 2 m/s toward target
@@ -446,10 +512,10 @@ class BatchedDroneEnv:
         else:
             # Curriculum: spawn near target gate
             # Pick random target gates
-            target_gi = torch.randint(0, NUM_GATES, (n,), device=dev)
-            gate_pos = self.gates_pos[target_gi]    # [n, 3]
-            gate_yaw = self.gates_yaw[target_gi]    # [n]
-            gate_normal = self.gates_normal[target_gi]  # [n, 3]
+            target_gi = torch.randint(0, self.num_gates, (n,), device=dev)
+            gate_pos = self.gates_pos[ei, target_gi]    # [n, 3]
+            gate_yaw = self.gates_yaw[ei, target_gi]    # [n]
+            gate_normal = self.gates_normal[ei, target_gi]  # [n, 3]
 
             # Spawn distance: lerp 3-5m (easy) to full hall (hard)
             easy_dist_min, easy_dist_max = 3.0, 5.0
@@ -497,15 +563,19 @@ class BatchedDroneEnv:
 
         return torch.cat([p, v, q, w, motors], dim=-1), None
 
-    def _find_nearest_gate(self, positions):
-        """Find nearest gate ahead for each position. [N, 3] -> [N] long."""
-        N = positions.shape[0]
-        best_idx = torch.zeros(N, dtype=torch.long, device=self.device)
-        best_dist = torch.full((N,), 1e10, device=self.device)
+    def _find_nearest_gate(self, positions, env_indices=None):
+        """Find nearest gate ahead for each position. [n, 3] -> [n] long.
+        env_indices: [n] long tensor of env slots (for per-env gate lookup).
+                     If None, uses first n envs."""
+        n = positions.shape[0]
+        if env_indices is None:
+            env_indices = torch.arange(n, device=self.device)
+        best_idx = torch.zeros(n, dtype=torch.long, device=self.device)
+        best_dist = torch.full((n,), 1e10, device=self.device)
 
-        for i in range(NUM_GATES):
-            gate_pos = self.gates_pos[i]
-            normal = self.gates_normal[i]
+        for i in range(self.num_gates):
+            gate_pos = self.gates_pos[env_indices, i]    # [n, 3]
+            normal = self.gates_normal[env_indices, i]   # [n, 3]
             diff = positions - gate_pos
             signed_dist = (diff * normal).sum(dim=-1)
             dist = diff.norm(dim=-1)
@@ -519,8 +589,19 @@ class BatchedDroneEnv:
     def reset_all(self):
         """Reset all environments."""
         mask = torch.ones(self.N, dtype=torch.bool, device=self.device)
+        all_indices = self.arange_N
+        # Assign random tracks for multi-track mode
+        if self.multi_track:
+            track_choices = torch.randint(0, self.num_tracks, (self.N,), device=self.device)
+            self.env_track[:] = track_choices
+            self.gates_pos[:] = self.track_gates_pos[track_choices]
+            self.gates_yaw[:] = self.track_gates_yaw[track_choices]
+            self.gates_normal[:] = self.track_gates_normal[track_choices]
+            self.gates_R_inv[:] = self.track_gates_R_inv[track_choices]
+            self.next_gate_local[:] = self.track_next_gate_local[track_choices]
+            self.next_gate_yaw_rel[:] = self.track_next_gate_yaw_rel[track_choices]
         self._randomize_params(mask)
-        states, target_gates = self._random_state(self.N)
+        states, target_gates = self._random_state(self.N, env_indices=all_indices)
         self.states = states
         self.prev_states = self.states.clone()
         self.prev_motor_speeds = self.states[:, 13:17].clone()
@@ -529,8 +610,10 @@ class BatchedDroneEnv:
         elif self.segment is not None:
             self.gate_idx[:] = self.segment[1]
         else:
-            self.gate_idx = self._find_nearest_gate(self.states[:, 0:3])
+            self.gate_idx = self._find_nearest_gate(self.states[:, 0:3], env_indices=all_indices)
         self.step_counts.zero_()
+        self.ep_gate_start = self.gate_idx.clone()
+        self.ep_start_segment = self.gate_idx.clone()
         return self.get_obs()
 
     def reset_envs(self, mask):
@@ -538,8 +621,19 @@ class BatchedDroneEnv:
         n = mask.sum().item()
         if n == 0:
             return
+        reset_indices = mask.nonzero(as_tuple=True)[0]
+        # Assign random tracks for multi-track mode
+        if self.multi_track:
+            track_choices = torch.randint(0, self.num_tracks, (n,), device=self.device)
+            self.env_track[reset_indices] = track_choices
+            self.gates_pos[reset_indices] = self.track_gates_pos[track_choices]
+            self.gates_yaw[reset_indices] = self.track_gates_yaw[track_choices]
+            self.gates_normal[reset_indices] = self.track_gates_normal[track_choices]
+            self.gates_R_inv[reset_indices] = self.track_gates_R_inv[track_choices]
+            self.next_gate_local[reset_indices] = self.track_next_gate_local[track_choices]
+            self.next_gate_yaw_rel[reset_indices] = self.track_next_gate_yaw_rel[track_choices]
         self._randomize_params(mask)
-        new_states, target_gates = self._random_state(n)
+        new_states, target_gates = self._random_state(n, env_indices=reset_indices)
         self.states[mask] = new_states
         self.prev_states[mask] = new_states
         self.prev_motor_speeds[mask] = new_states[:, 13:17]
@@ -548,8 +642,10 @@ class BatchedDroneEnv:
         elif self.segment is not None:
             self.gate_idx[mask] = self.segment[1]
         else:
-            self.gate_idx[mask] = self._find_nearest_gate(new_states[:, 0:3])
+            self.gate_idx[mask] = self._find_nearest_gate(new_states[:, 0:3], env_indices=reset_indices)
         self.step_counts[mask] = 0
+        self.ep_gate_start[mask] = self.gate_idx[mask]
+        self.ep_start_segment[mask] = self.gate_idx[mask]
 
     def get_obs(self):
         """Compute 24D gate-relative observation for all envs. Returns [N, 24]."""
@@ -562,10 +658,11 @@ class BatchedDroneEnv:
         euler = batch_quat_to_euler(q)
 
         # Gather per-env gate data
-        gi = self.gate_idx % NUM_GATES
-        gate_pos = self.gates_pos[gi]           # [N, 3]
-        gate_R_inv = self.gates_R_inv[gi]       # [N, 3, 3]
-        gate_yaw = self.gates_yaw[gi]           # [N]
+        gi = self.gate_idx % self.num_gates
+        aN = self.arange_N
+        gate_pos = self.gates_pos[aN, gi]           # [N, 3]
+        gate_R_inv = self.gates_R_inv[aN, gi]       # [N, 3, 3]
+        gate_yaw = self.gates_yaw[aN, gi]           # [N]
 
         # Transform to gate frame
         p_rel = p_w - gate_pos                  # [N, 3]
@@ -592,8 +689,8 @@ class BatchedDroneEnv:
         dist_gate = p_rel.norm(dim=-1, keepdim=True)  # [N, 1]
 
         # Next gate in current gate frame (precomputed)
-        p_next_g = self.next_gate_local[gi]     # [N, 3]
-        yaw_next = self.next_gate_yaw_rel[gi]   # [N]
+        p_next_g = self.next_gate_local[aN, gi]     # [N, 3]
+        yaw_next = self.next_gate_yaw_rel[aN, gi]   # [N]
 
         obs = torch.cat([
             p_g,                                # 3
@@ -658,17 +755,18 @@ class BatchedDroneEnv:
         w_body = self.states[:, 10:13]
         q = self.states[:, 6:10]
 
-        gi = self.gate_idx % NUM_GATES
-        gate_pos = self.gates_pos[gi]  # [N, 3]
+        gi = self.gate_idx % self.num_gates
+        aN = self.arange_N
+        gate_pos = self.gates_pos[aN, gi]  # [N, 3]
 
         # 1. Progress reward
         dist_prev = (p_prev - gate_pos).norm(dim=-1)
         dist_curr = (p - gate_pos).norm(dim=-1)
         progress = dist_prev - dist_curr
-        r_prog = LAMBDA_PROG * torch.clamp(progress, max=V_MAX * self.dt)
+        r_prog = self.lambda_prog * torch.clamp(progress, max=V_MAX * self.dt)
 
         # 2. Gate passage detection (batched)
-        gate_normal = self.gates_normal[gi]  # [N, 3]
+        gate_normal = self.gates_normal[aN, gi]  # [N, 3]
         d_prev = ((p_prev - gate_pos) * gate_normal).sum(dim=-1)
         d_curr = ((p - gate_pos) * gate_normal).sum(dim=-1)
 
@@ -679,7 +777,7 @@ class BatchedDroneEnv:
         p_cross = p_prev + t_cross.unsqueeze(-1) * (p - p_prev)
 
         # Local coordinates at crossing
-        gate_R_inv = self.gates_R_inv[gi]
+        gate_R_inv = self.gates_R_inv[aN, gi]
         local = torch.bmm(gate_R_inv, (p_cross - gate_pos).unsqueeze(-1)).squeeze(-1)
 
         half = self.gate_size / 2.0
@@ -689,7 +787,10 @@ class BatchedDroneEnv:
 
         offset = (local[:, 1]**2 + local[:, 2]**2).sqrt()
 
-        r_gate = torch.where(within, torch.tensor(LAMBDA_GATE, device=self.device),
+        # Escalating gate reward: base + inc * (gates passed so far in episode)
+        ep_gates_so_far = (self.gate_idx - self.ep_gate_start).float()
+        per_env_gate_reward = self.lambda_gate + self.lambda_gate_inc * ep_gates_so_far
+        r_gate = torch.where(within, per_env_gate_reward,
                              torch.zeros(1, device=self.device))
         r_offset = torch.where(within, -LAMBDA_OFFSET * offset,
                                torch.zeros(1, device=self.device))
@@ -745,7 +846,7 @@ class BatchedDroneEnv:
         R_rate[:, 2, 1] = 2 * (qy*qz + qw*qx)
         R_rate[:, 2, 2] = 1 - 2 * (qx**2 + qy**2)
         w_world = torch.bmm(R_rate, w_body.unsqueeze(-1)).squeeze(-1)
-        r_rate = -LAMBDA_RATE * (w_world**2).sum(dim=-1)
+        r_rate = -self.lambda_rate * (w_world**2).sum(dim=-1)
 
         # 5. Perception penalty: angle between camera axis and gate direction
         gate_dir = gate_pos - p  # [N, 3]
@@ -763,6 +864,14 @@ class BatchedDroneEnv:
                              -LAMBDA_PERC * theta_cam,
                              torch.zeros(1, device=self.device))
 
+        # Accumulate reward components for logging
+        self.reward_components['prog'] += r_prog.sum().item()
+        self.reward_components['gate'] += r_gate.sum().item()
+        self.reward_components['offset'] += r_offset.sum().item()
+        self.reward_components['rate'] += r_rate.sum().item()
+        self.reward_components['perc'] += r_perc.sum().item()
+        self.reward_components['align'] += r_align.sum().item()
+
         rewards = r_prog + r_gate + r_offset + r_rate + r_perc + r_align
 
         # Termination
@@ -778,11 +887,22 @@ class BatchedDroneEnv:
         if self.single_gate:
             completed = within  # Pass one gate = success
         else:
-            completed = self.gate_idx >= NUM_GATES * NUM_LAPS
+            completed = self.gate_idx >= self.num_gates * NUM_LAPS
         truncated = self.step_counts >= MAX_EPISODE_STEPS
 
         rewards[crashed] -= LAMBDA_CRASH
 
         dones = crashed | completed | truncated
         self.episodes_ended_count += dones.sum().item()
+
+        # Record per-episode gate counts for done episodes
+        if dones.any():
+            ep_gates = (self.gate_idx[dones] - self.ep_gate_start[dones]).cpu().tolist()
+            self.ep_gates_list.extend(ep_gates)
+            # Per-segment tracking
+            start_segs = (self.ep_start_segment[dones] % self.num_gates).cpu().tolist()
+            for seg, gates in zip(start_segs, ep_gates):
+                self.segment_gates[seg] += gates
+                self.segment_episodes[seg] += 1
+
         return rewards, dones
