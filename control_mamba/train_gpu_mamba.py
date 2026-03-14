@@ -151,13 +151,26 @@ class MambaBlock(nn.Module):
         return torch.stack(outputs), (ssm_state, conv_state)
 
 
+def _make_mamba_block(d_model, d_state, d_conv, expand, use_fast=True):
+    """Create a Mamba block — uses official CUDA kernels if available, else pure PyTorch."""
+    if use_fast:
+        try:
+            from control_mamba.mamba_fast import FastMambaBlock, HAS_MAMBA_SSM
+            if HAS_MAMBA_SSM:
+                return FastMambaBlock(d_model, d_state, d_conv, expand)
+        except ImportError:
+            pass
+    return MambaBlock(d_model, d_state, d_conv, expand)
+
+
 class MambaActorCritic(nn.Module):
     """
     Actor-Critic with Mamba (selective SSM) instead of LSTM.
     Separate Mamba blocks + MLP heads for actor and critic.
+    Uses official mamba-ssm CUDA kernels when available for 10-20x speedup.
     """
     def __init__(self, obs_dim=OBS_DIM, act_dim=4, d_model=64, d_state=16,
-                 d_conv=4, expand=2, n_mamba_layers=1):
+                 d_conv=4, expand=2, n_mamba_layers=1, use_fast=True):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -172,11 +185,11 @@ class MambaActorCritic(nn.Module):
 
         # Separate Mamba blocks for actor and critic (can stack multiple)
         self.actor_mamba = nn.ModuleList([
-            MambaBlock(d_model, d_state, d_conv, expand)
+            _make_mamba_block(d_model, d_state, d_conv, expand, use_fast)
             for _ in range(n_mamba_layers)
         ])
         self.critic_mamba = nn.ModuleList([
-            MambaBlock(d_model, d_state, d_conv, expand)
+            _make_mamba_block(d_model, d_state, d_conv, expand, use_fast)
             for _ in range(n_mamba_layers)
         ])
 

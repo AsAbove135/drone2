@@ -1,0 +1,11 @@
+{
+  "hourly_max": 1.50,
+  "daily_cap": 15.00,
+  "weekly_cap": 75.00,
+  "monthly_cap": 200.00,
+  "per_experiment_cap": 8.00,
+  "total_budget": 300.00,
+  "max_concurrent_instances": 3,
+  "preferred_gpu": "RTX_4090",
+  "max_gpu_price": 0.45
+}

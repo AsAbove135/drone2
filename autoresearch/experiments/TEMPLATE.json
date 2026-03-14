@@ -1,0 +1,29 @@
+{
+  "_comment": "Copy this file, rename to NN_descriptive_name.json. Experiments run in filename order.",
+
+  "name": "experiment_slug",
+  "hypothesis": "What you expect to learn from this experiment.",
+  "rationale": "Why this is worth testing, cite previous experiments.",
+  "parent": null,
+
+  "model_type": "fsppo",
+  "frame_stack": 16,
+
+  "total_timesteps": 100000000,
+  "num_envs": 2048,
+  "n_steps": 512,
+  "n_epochs": 5,
+  "lr": 0.0003,
+  "ent_coef": 0.005,
+  "cosine_lr": true,
+  "lr_cycle": 50000000,
+  "lr_min": 0.00001,
+
+  "random_segments": true,
+
+  "eval_episodes": 20,
+  "eval_tracks": ["kidney", "figure8"],
+  "success_metric": "avg_gates",
+  "success_threshold": null,
+  "status": "pending"
+}

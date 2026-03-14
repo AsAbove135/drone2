@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /c/Users/pbmod/PycharmProjects/drone2/control/ | grep -E \"\\\\.py$\")",
+      "Bash(wc -l /c/Users/pbmod/PycharmProjects/drone2/control/*.py /c/Users/pbmod/PycharmProjects/drone2/control_rppo/*.py /c/Users/pbmod/PycharmProjects/drone2/control_mamba/*.py /c/Users/pbmod/PycharmProjects/drone2/control_fsppo/*.py)",
+      "Bash(python -c \"from autoresearch.experiment import ExperimentConfig; c = ExperimentConfig.load\\('autoresearch/experiments/01_fsppo_higher_entropy.yaml'\\); print\\(f'Loaded: {c.name}'\\); print\\(f'Model: {c.model_type}'\\); print\\(f'Steps: {c.total_timesteps:,}'\\); print\\(f'Train script: {c.train_script}'\\); print\\(f'Args: {c.to_train_args\\(\\)}'\\)\")",
+      "Bash(ls .venv/Scripts/python* 2>/dev/null || which python3 || echo \"checking py launcher\" && py -3 --version 2>/dev/null)",
+      "Bash(.venv/Scripts/python.exe -c \"from autoresearch.experiment import ExperimentConfig; c = ExperimentConfig.load\\('autoresearch/experiments/01_fsppo_higher_entropy.yaml'\\); print\\(f'Loaded: {c.name}'\\); print\\(f'Model: {c.model_type}'\\); print\\(f'Steps: {c.total_timesteps:,}'\\); print\\(f'Train script: {c.train_script}'\\); print\\(f'CLI args: {\\\\\" \\\\\".join\\(c.to_train_args\\(\\)\\)}'\\)\")",
+      "Bash(.venv/Scripts/pip.exe install:*)",
+      "Bash(.venv/Scripts/python.exe -m pip install pyyaml 2>&1 | tail -5)",
+      "Bash(.venv/Scripts/python.exe -c \"\nfrom autoresearch.experiment import ExperimentConfig\nc = ExperimentConfig.load\\('autoresearch/experiments/01_fsppo_higher_entropy.json'\\)\nprint\\(f'Loaded: {c.name}'\\)\nprint\\(f'Model: {c.model_type}'\\)\nprint\\(f'Steps: {c.total_timesteps:,}'\\)\nprint\\(f'Train script: {c.train_script}'\\)\nprint\\(f'CLI args: {chr\\(10\\).join\\([\\\\\"\\\\\"] + c.to_train_args\\(\\)\\)}'\\)\n\")",
+      "Bash(.venv/Scripts/python.exe -m autoresearch run autoresearch/experiments/01_fsppo_higher_entropy.json --dry-run 2>&1)",
+      "Bash(.venv/Scripts/python.exe -c \"import numpy; import torch; import matplotlib; print\\('all deps OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -m autoresearch queue --dry-run 2>&1)",
+      "WebFetch(domain:openviking.ai)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "Bash(.venv/Scripts/python.exe -c \"\nfrom autoresearch.cloud.coordinator import count_queued_experiments\nn = count_queued_experiments\\('autoresearch/queue'\\)\nprint\\(f'Queued experiments: {n}'\\)\n\")",
+      "Bash(GPU_COST_PER_HOUR=0.35 GPU_TYPE=RTX_4090 .venv/Scripts/python.exe -m autoresearch run autoresearch/experiments/01_fsppo_higher_entropy.json --dry-run 2>&1)",
+      "Bash(cat /c/Users/pbmod/PycharmProjects/drone2/training_output/autoresearch/20260314_122957_fsppo_higher_entropy/config.json 2>/dev/null | .venv/Scripts/python.exe -m json.tool 2>/dev/null | head -20)",
+      "Bash(.venv/Scripts/python.exe -c \"\nimport json\nwith open\\('training_output/autoresearch/20260314_122957_fsppo_higher_entropy/config.json'\\) as f:\n    d = json.load\\(f\\)\nfor k in ['gpu_cost_per_hour','gpu_type','estimated_hours','estimated_cost','actual_hours','actual_cost','cost_efficiency','status']:\n    print\\(f'{k}: {d.get\\(k\\)}'\\)\n\")",
+      "Bash(.venv/Scripts/python.exe -c \"\nfrom autoresearch.cloud.worker import WORKER_ID, USE_FEATURE_BRANCHES\nprint\\(f'Worker: {WORKER_ID}'\\)\nprint\\(f'Feature branches: {USE_FEATURE_BRANCHES}'\\)\n\nfrom autoresearch.cloud.costs import CostTracker, Budget\nimport json\nwith open\\('autoresearch/budget.json'\\) as f:\n    b = Budget\\(**json.load\\(f\\)\\)\nt = CostTracker\\(b\\)\nok, reason = t.can_launch\\(0.35\\)\nprint\\(f'Can launch @ \\\\$0.35/hr: {ok} \\({reason}\\)'\\)\nprint\\('All imports OK'\\)\n\")",
+      "Bash(./venv/Scripts/python --version 2>&1 || python --version)",
+      "Bash(find .venv/Lib/site-packages -name \"torch\" -type d 2>/dev/null | head -1 | xargs -I {} cat {}/version.py 2>/dev/null || echo \"Checking differently...\")",
+      "Bash(ls .venv/Lib/site-packages/*.dist-info/ 2>/dev/null | grep -E \"torch|cuda\" | head -5)",
+      "Bash(ls -1 .venv/Lib/site-packages/*.dist-info | head -30)",
+      "Bash(cat .venv/Lib/site-packages/pip-*/top_level.txt 2>/dev/null | head -20)",
+      "Bash(.venv/Scripts/python.exe -c \"\nfrom control_mamba.mamba_fast import FastMambaBlock, HAS_MAMBA_SSM\nprint\\(f'mamba-ssm installed: {HAS_MAMBA_SSM}'\\)\nblock = FastMambaBlock\\(d_model=64, d_state=16, d_conv=4, expand=2\\)\nprint\\(f'Created block \\(using fast path: {block._use_fast}\\)'\\)\nprint\\(f'Fallback to pure PyTorch: {not block._use_fast}'\\)\n\" 2>&1)",
+      "Bash(.venv/Scripts/python.exe -c \"\nimport ast, sys\nwith open\\('control_mamba/mamba_fast.py'\\) as f:\n    tree = ast.parse\\(f.read\\(\\)\\)\nprint\\(f'mamba_fast.py: valid Python \\({len\\(tree.body\\)} top-level nodes\\)'\\)\n\nwith open\\('control_mamba/train_gpu_mamba.py'\\) as f:\n    tree = ast.parse\\(f.read\\(\\)\\)\nprint\\(f'train_gpu_mamba.py: valid Python \\({len\\(tree.body\\)} top-level nodes\\)'\\)\n\")"
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "budget": {
+    "hourly_max": 1.5,
+    "daily_cap": 15.0,
+    "weekly_cap": 75.0,
+    "monthly_cap": 200.0,
+    "per_experiment_cap": 8.0,
+    "total_budget": 300.0,
+    "max_concurrent_instances": 3,
+    "preferred_gpu": "RTX_4090",
+    "max_gpu_price": 0.45
+  },
+  "entries": [],
+  "last_updated": "2026-03-14T12:32:56.818387"
+}

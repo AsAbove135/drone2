@@ -1,0 +1,25 @@
+{
+  "name": "fsppo_higher_entropy",
+  "hypothesis": "Increasing entropy coefficient from 0.005 to 0.01 will prevent premature convergence and improve multi-gate performance beyond the current FSPPO fs16 baseline (exp #26: 4.21 avg gates at 100M steps).",
+  "rationale": "Experiment #22 (RPPO 500M) showed entropy rising to 6.86 correlated with best avg gates (5.82). Current FSPPO may be collapsing exploration too early. Higher entropy should maintain diverse trajectories through difficult gate transitions (segments 4 and 8 are bottlenecks).",
+  "parent": "exp26_fsppo_fs16",
+
+  "model_type": "fsppo",
+  "frame_stack": 16,
+  "total_timesteps": 200000000,
+  "num_envs": 2048,
+  "n_steps": 512,
+  "n_epochs": 5,
+  "lr": 0.0003,
+  "ent_coef": 0.01,
+  "cosine_lr": true,
+  "lr_cycle": 50000000,
+  "lr_min": 0.00001,
+  "random_segments": true,
+
+  "eval_episodes": 20,
+  "eval_tracks": ["kidney", "figure8"],
+  "success_metric": "avg_gates",
+  "success_threshold": 4.5,
+  "status": "pending"
+}

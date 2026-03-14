@@ -1,0 +1,28 @@
+{
+  "name": "rppo_256_hidden",
+  "hypothesis": "Doubling LSTM hidden size from 128 to 256 will improve multi-gate performance by giving the recurrent state more capacity to encode gate sequence and flight history information.",
+  "rationale": "RPPO is the best architecture for high gate counts (exp #22: 5.82 avg gates, 29% full laps). The 128-unit LSTM may be bottlenecking representation capacity. A larger LSTM may better capture the temporal dependencies needed for consistent multi-gate traversal.",
+  "parent": "exp22_rppo_500M",
+
+  "model_type": "rppo",
+  "lstm_hidden": 256,
+  "lstm_layers": 1,
+  "seq_len": 16,
+  "total_timesteps": 200000000,
+  "num_envs": 2048,
+  "n_steps": 512,
+  "n_epochs": 5,
+  "lr": 0.0003,
+  "ent_coef": 0.005,
+  "num_seq_per_batch": 64,
+  "cosine_lr": true,
+  "lr_cycle": 50000000,
+  "lr_min": 0.00001,
+  "random_segments": true,
+
+  "eval_episodes": 20,
+  "eval_tracks": ["kidney", "figure8"],
+  "success_metric": "avg_gates",
+  "success_threshold": 5.0,
+  "status": "pending"
+}
